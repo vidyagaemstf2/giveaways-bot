@@ -7,13 +7,13 @@
 #include <giveaways>
 #include <ripext>
 
-#define PLUGIN_VERSION "1.1.0"
+#define PLUGIN_VERSION "1.2.0"
 #define PRIZE_MAX 127
+#define INVENTORY_FILE "data/giveaways_bot_inventory.json"
 
 bool g_bBotInitiated;
 bool g_bHttpInProgress;
 
-Database g_Database;
 ConVar g_cvApiBase;
 ConVar g_cvApiSecret;
 ConVar g_cvBotProfileUrl;
@@ -23,7 +23,7 @@ ArrayList g_PrizeStrings;
 public Plugin myinfo = {
   name = "Giveaways — Steam bot bridge",
   author = "vidya-steam-bot",
-  description = "Inventory menu + pending_deliveries for vidya-steam-bot",
+  description = "Inventory menu + delivery recording for vidya-steam-bot",
   version = PLUGIN_VERSION,
   url = "https://github.com/vidyagaemstf2/giveaways-bot"
 };
@@ -34,7 +34,7 @@ public void OnPluginStart() {
   g_cvApiBase = CreateConVar(
     "sm_giveaways_bot_api_base",
     "http://127.0.0.1:3000",
-    "Base URL of the Steam bot HTTP API (no trailing slash). Paths /inventory, /friend-status/:steamid64, /delivery/trigger are appended automatically."
+    "Base URL of the Steam bot HTTP API (no trailing slash). Paths /inventory, /delivery/record are appended automatically."
   );
   g_cvApiSecret = CreateConVar(
     "sm_giveaways_bot_api_secret",
@@ -51,21 +51,6 @@ public void OnPluginStart() {
   AutoExecConfig(true, "giveaways_bot", "sourcemod");
 
   g_PrizeStrings = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
-
-  if (SQL_CheckConfig("giveaways_bot")) {
-    Database.Connect(OnDatabaseConnect, "giveaways_bot");
-  } else {
-    LogError("[giveaways_bot] databases.cfg missing \"giveaways_bot\" entry — DB inserts disabled.");
-  }
-}
-
-void OnDatabaseConnect(Database db, const char[] error, any data) {
-  if (db == null) {
-    LogError("[giveaways_bot] Database connect failed: %s", error);
-    return;
-  }
-  g_Database = db;
-  LogMessage("[giveaways_bot] Connected to database \"giveaways_bot\".");
 }
 
 void TrimTrailingSlash(char[] s) {
@@ -114,7 +99,7 @@ public Action Giveaways_OnGiveawayStart(int client, const char[] prize) {
   }
 
   char url[512];
-  FormatApiUrl("/inventory", url, sizeof(url));
+  FormatApiUrl("/inventory?minimal=1", url, sizeof(url));
   if (url[0] == '\0') {
     PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_base is not set.");
     return Plugin_Handled;
@@ -122,15 +107,18 @@ public Action Giveaways_OnGiveawayStart(int client, const char[] prize) {
 
   g_bHttpInProgress = true;
 
+  char path[PLATFORM_MAX_PATH];
+  BuildPath(Path_SM, path, sizeof(path), INVENTORY_FILE);
+
   HTTPRequest req = new HTTPRequest(url);
   req.SetHeader("X-Bot-Secret", "%s", secret);
   req.Timeout = 30;
-  req.Get(OnInventoryHttp, GetClientUserId(client));
+  req.DownloadFile(path, OnInventoryFile, GetClientUserId(client));
 
   return Plugin_Handled;
 }
 
-void OnInventoryHttp(HTTPResponse response, any userid, const char[] error) {
+void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
   g_bHttpInProgress = false;
 
   int client = GetClientOfUserId(userid);
@@ -138,26 +126,32 @@ void OnInventoryHttp(HTTPResponse response, any userid, const char[] error) {
     return;
   }
 
-  if (error[0] != '\0') {
-    PrintToChat(client, "[Giveaways] HTTP error: %s", error);
+  if (status != HTTPStatus_OK) {
+    if (error[0] != '\0') {
+      PrintToChat(client, "[Giveaways] HTTP %d — %s", status, error);
+    } else {
+      PrintToChat(client, "[Giveaways] Bot returned HTTP %d.", status);
+    }
     return;
   }
 
-  if (response.Status != HTTPStatus_OK) {
-    PrintToChat(client, "[Giveaways] Bot returned HTTP %d.", response.Status);
+  char path[PLATFORM_MAX_PATH];
+  BuildPath(Path_SM, path, sizeof(path), INVENTORY_FILE);
+
+  JSONArray arr = JSONArray.FromFile(path);
+  DeleteFile(path);
+
+  if (arr == null) {
+    if (error[0] != '\0') {
+      LogError("[giveaways_bot] Inventory parse failed (transport: %s)", error);
+    }
+    PrintToChat(client, "[Giveaways] Failed to read bot inventory.");
     return;
   }
 
-  JSON root = response.Data;
-  if (root == null || !IsValidHandle(root)) {
-    PrintToChat(client, "[Giveaways] Empty or invalid JSON from bot.");
-    return;
-  }
-
-  JSONArray arr = view_as<JSONArray>(root);
   int len = arr.Length;
   if (len == 0) {
-    delete root;
+    delete arr;
     PrintToChat(client, "[Giveaways] Bot inventory is empty.");
     return;
   }
@@ -188,7 +182,7 @@ void OnInventoryHttp(HTTPResponse response, any userid, const char[] error) {
     g_PrizeStrings.PushString(prize);
   }
 
-  delete root;
+  delete arr;
 
   if (g_PrizeStrings.Length == 0) {
     PrintToChat(client, "[Giveaways] No usable items in bot inventory.");
@@ -332,7 +326,7 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
 
   int pipe = FindCharInString(normalized, '|');
   if (pipe <= 0) {
-    LogMessage("[giveaways_bot] Prize has no '|' separator; skipping DB insert.");
+    LogMessage("[giveaways_bot] Prize has no '|' separator; skipping delivery record.");
     return;
   }
 
@@ -353,52 +347,65 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
     return;
   }
 
-  if (g_Database == null) {
-    LogError("[giveaways_bot] Database not connected; cannot insert pending_deliveries.");
-    return;
-  }
-
-  char query[2048];
-  g_Database.Format(
-    query,
-    sizeof(query),
-    "INSERT INTO pending_deliveries (winner_steam_id, asset_id, item_name, status) VALUES ('%s', '%s', '%s', 'pending')",
-    steamId,
-    assetId,
-    itemName
-  );
-
-  DataPack dp = new DataPack();
-  dp.WriteCell(GetClientUserId(winner));
-  dp.WriteString(steamId);
-  g_Database.Query(OnInsertDelivery, query, dp);
-}
-
-void RequestFriendStatusAfterPrizeRecorded(int winnerUid, const char[] steamId64) {
   char secret[256];
   g_cvApiSecret.GetString(secret, sizeof(secret));
   if (secret[0] == '\0') {
-    PrintWinnerAddBotHint(winnerUid);
+    PrintWinnerAddBotHint(GetClientUserId(winner));
     return;
   }
 
   char url[512];
-  char path[96];
-  Format(path, sizeof(path), "/friend-status/%s", steamId64);
-  FormatApiUrl(path, url, sizeof(url));
+  FormatApiUrl("/delivery/record", url, sizeof(url));
   if (url[0] == '\0') {
-    PrintWinnerAddBotHint(winnerUid);
+    PrintWinnerAddBotHint(GetClientUserId(winner));
     return;
   }
 
-  DataPack dp = new DataPack();
-  dp.WriteCell(winnerUid);
-  dp.WriteString(steamId64);
+  JSONObject body = new JSONObject();
+  body.SetString("steamId64", steamId);
+  body.SetString("assetId", assetId);
+  body.SetString("itemName", itemName);
 
   HTTPRequest req = new HTTPRequest(url);
   req.SetHeader("X-Bot-Secret", "%s", secret);
-  req.Timeout = 15;
-  req.Get(OnFriendStatusAfterGiveaway, dp);
+  req.Timeout = 30;
+  req.Post(body, OnDeliveryRecordHttp, GetClientUserId(winner));
+}
+
+void OnDeliveryRecordHttp(HTTPResponse response, any userid, const char[] error) {
+  if (error[0] != '\0') {
+    LogError("[giveaways_bot] POST /delivery/record failed: %s", error);
+    PrintWinnerAddBotHint(userid);
+    return;
+  }
+
+  if (response.Status != HTTPStatus_Created && response.Status != HTTPStatus_OK) {
+    LogError("[giveaways_bot] POST /delivery/record HTTP %d", response.Status);
+    PrintWinnerAddBotHint(userid);
+    return;
+  }
+
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  bool isFriend = false;
+  JSON root = response.Data;
+  if (root != null && IsValidHandle(root)) {
+    JSONObject obj = view_as<JSONObject>(root);
+    isFriend = obj.GetBool("isFriend");
+    delete root;
+  }
+
+  if (isFriend) {
+    PrintToChat(
+      client,
+      "[Giveaways] You're already Steam friends with the bot — a trade offer should arrive shortly; check Steam."
+    );
+  } else {
+    PrintWinnerAddBotHint(userid);
+  }
 }
 
 void PrintWinnerAddBotHint(int winnerUid) {
@@ -409,94 +416,4 @@ void PrintWinnerAddBotHint(int winnerUid) {
   char profileUrl[512];
   g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
   PrintToChat(w, "[Giveaways] Congratulations! Add %s to receive your prize.", profileUrl);
-}
-
-void OnFriendStatusAfterGiveaway(HTTPResponse response, any datapack, const char[] error) {
-  DataPack dp = view_as<DataPack>(datapack);
-  int winnerUid = 0;
-  char steamId64[32];
-  steamId64[0] = '\0';
-  if (dp != null) {
-    ResetPack(dp);
-    winnerUid = dp.ReadCell();
-    dp.ReadString(steamId64, sizeof(steamId64));
-    delete dp;
-  }
-
-  bool isFriend = false;
-  if (error[0] == '\0' && response.Status == HTTPStatus_OK && response.Data != null && IsValidHandle(response.Data)) {
-    JSONObject root = view_as<JSONObject>(response.Data);
-    isFriend = root.GetBool("isFriend");
-    delete root;
-  }
-
-  int w = GetClientOfUserId(winnerUid);
-
-  if (isFriend) {
-    RequestDeliveryTrigger(steamId64);
-    if (w > 0 && IsClientInGame(w)) {
-      PrintToChat(
-        w,
-        "[Giveaways] You're already Steam friends with the bot — a trade offer should arrive shortly; check Steam."
-      );
-    }
-  } else {
-    PrintWinnerAddBotHint(winnerUid);
-  }
-}
-
-void RequestDeliveryTrigger(const char[] steamId64) {
-  char secret[256];
-  g_cvApiSecret.GetString(secret, sizeof(secret));
-  if (secret[0] == '\0') {
-    return;
-  }
-
-  char url[512];
-  FormatApiUrl("/delivery/trigger", url, sizeof(url));
-  if (url[0] == '\0') {
-    return;
-  }
-
-  JSONObject body = new JSONObject();
-  body.SetString("steamId64", steamId64);
-
-  HTTPRequest req = new HTTPRequest(url);
-  req.SetHeader("X-Bot-Secret", "%s", secret);
-  req.Timeout = 30;
-  req.Post(body, OnDeliveryTriggerHttp, 0);
-}
-
-void OnDeliveryTriggerHttp(HTTPResponse response, any value, const char[] error) {
-  if (error[0] != '\0') {
-    LogError("[giveaways_bot] POST /delivery/trigger failed: %s", error);
-    return;
-  }
-  if (response.Status != HTTPStatus_Accepted && response.Status != HTTPStatus_OK) {
-    LogError("[giveaways_bot] POST /delivery/trigger HTTP %d", response.Status);
-  }
-}
-
-void OnInsertDelivery(Database db, DBResultSet results, const char[] error, any data) {
-  int winnerUid = 0;
-  char steamId[32];
-  steamId[0] = '\0';
-  DataPack dp = view_as<DataPack>(data);
-  if (dp != null) {
-    ResetPack(dp);
-    winnerUid = dp.ReadCell();
-    dp.ReadString(steamId, sizeof(steamId));
-    delete dp;
-  }
-
-  if (error[0] != '\0') {
-    LogError("[giveaways_bot] INSERT failed: %s", error);
-    int w = GetClientOfUserId(winnerUid);
-    if (w > 0 && IsClientInGame(w)) {
-      PrintToChat(w, "[Giveaways] Could not record your prize in the database. Contact an admin.");
-    }
-    return;
-  }
-
-  RequestFriendStatusAfterPrizeRecorded(winnerUid, steamId);
 }
