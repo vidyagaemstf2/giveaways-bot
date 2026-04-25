@@ -7,7 +7,7 @@
 #include <giveaways>
 #include <ripext>
 
-#define PLUGIN_VERSION "1.4"
+#define PLUGIN_VERSION "1.5"
 #define PRIZE_MAX 127
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
 #define TRADE_OFFER_ID_MAX 64
@@ -20,12 +20,16 @@ ConVar g_cvApiSecret;
 ConVar g_cvBotProfileUrl;
 
 ArrayList g_PrizeStrings;
+ArrayList g_PrizeAssetIds;
 ArrayList g_DonationOfferIds;
+
+char g_ActivePrizeName[256];
+char g_ActiveAssetId[128];
 
 public Plugin myinfo = {
   name = "Giveaways - Steam bot bridge",
-  author = "vidya-steam-bot",
-  description = "Inventory menu + delivery recording for vidya-steam-bot",
+  author = "ampere",
+  description = "Menu de inventario y registro de entregas para vidya-steam-bot",
   version = PLUGIN_VERSION,
   url = "https://github.com/vidyagaemstf2/giveaways-bot"
 };
@@ -36,26 +40,30 @@ public void OnPluginStart() {
   g_cvApiBase = CreateConVar(
     "sm_giveaways_bot_api_base",
     "http://127.0.0.1:3000",
-    "Base URL of the Steam bot HTTP API (no trailing slash). Paths /inventory, /delivery/record are appended automatically."
+    "URL base de la API HTTP del bot de Steam (sin barra final). Se agregan automaticamente rutas como /inventory y /delivery/record."
   );
   g_cvApiSecret = CreateConVar(
     "sm_giveaways_bot_api_secret",
     "",
-    "Same value as the bot's API_SECRET (sent as X-Bot-Secret).",
+    "Mismo valor que API_SECRET del bot (se manda como X-Bot-Secret).",
     FCVAR_PROTECTED
   );
   g_cvBotProfileUrl = CreateConVar(
     "sm_giveaways_bot_profile_url",
     "https://steamcommunity.com/id/your-bot",
-    "Steam profile/community URL shown to giveaway winners."
+    "URL del perfil/comunidad de Steam que se muestra a ganadores."
   );
 
   AutoExecConfig(true, "giveaways_bot", "sourcemod");
 
-  RegConsoleCmd("sm_donate", Command_Donate, "Open a Steam bot donation window.");
-  RegAdminCmd("sm_gdonations", Command_Donations, ADMFLAG_GENERIC, "Review pending Steam bot donations.");
+  RegConsoleCmd("sm_donar", Command_Donate, "Abrir una ventana de donacion con el bot de Steam.");
+  RegConsoleCmd("sm_donate", Command_Donate, "Abrir una ventana de donacion con el bot de Steam.");
+  RegAdminCmd("sm_donaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
+  RegAdminCmd("sm_gdonaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
+  RegAdminCmd("sm_gdonations", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
 
   g_PrizeStrings = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
+  g_PrizeAssetIds = new ArrayList(ByteCountToCells(128));
   g_DonationOfferIds = new ArrayList(ByteCountToCells(TRADE_OFFER_ID_MAX + 1));
 }
 
@@ -82,7 +90,7 @@ bool GetApiSecretOrReply(int client, char[] secret, int maxlen) {
   g_cvApiSecret.GetString(secret, maxlen);
   if (secret[0] == '\0') {
     if (client > 0) {
-      PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_secret is not set.");
+      PrintToChat(client, "[SM] sm_giveaways_bot_api_secret no esta configurado.");
     }
     return false;
   }
@@ -91,6 +99,7 @@ bool GetApiSecretOrReply(int client, char[] secret, int maxlen) {
 
 public void OnPluginEnd() {
   delete g_PrizeStrings;
+  delete g_PrizeAssetIds;
   delete g_DonationOfferIds;
 }
 
@@ -105,20 +114,20 @@ public Action Command_Donate(int client, int args) {
 
 void ShowDonationConfirmPanel(int client) {
   Panel panel = new Panel();
-  panel.SetTitle("Donate items to giveaways?");
+  panel.SetTitle("Donar items a los sorteos?");
   panel.DrawText(" ");
-  panel.DrawText("You are about to open a 15 minute donation window with the Steam bot.");
+  panel.DrawText("Estas por abrir una ventana de donacion de 15 minutos con el bot de Steam.");
   panel.DrawText(" ");
-  panel.DrawText("What happens next:");
-  panel.DrawText("- Add the bot on Steam if you are not friends.");
-  panel.DrawText("- Send a Steam trade offer with ONLY items you want to donate.");
-  panel.DrawText("- Put !donate in the Steam trade offer message.");
-  panel.DrawText("- Admins will review the offer before the bot accepts it.");
+  panel.DrawText("Que pasa despues:");
+  panel.DrawText("- Agrega al bot en Steam si todavia no son amigos.");
+  panel.DrawText("- Manda una oferta con SOLO los items que queres donar.");
+  panel.DrawText("- Pone !donar o !donate en el mensaje de la oferta.");
+  panel.DrawText("- Un admin va a revisar la oferta antes de que el bot la acepte.");
   panel.DrawText(" ");
-  panel.DrawText("Do not include items you expect to get back.");
+  panel.DrawText("No incluyas items que esperas recuperar.");
   panel.DrawText(" ");
-  panel.DrawItem("I understand - open donation window");
-  panel.DrawItem("Cancel");
+  panel.DrawItem("Entiendo - abrir ventana de donacion");
+  panel.DrawItem("Cancelar");
   panel.Send(client, PanelHandler_DonationConfirm, 45);
   delete panel;
 }
@@ -134,7 +143,7 @@ public int PanelHandler_DonationConfirm(Menu menu, MenuAction action, int param1
   }
 
   if (param2 != 1) {
-    PrintToChat(client, "[Giveaways] Donation cancelled.");
+    PrintToChat(client, "[SM] Donacion cancelada.");
     return 0;
   }
 
@@ -145,7 +154,7 @@ public int PanelHandler_DonationConfirm(Menu menu, MenuAction action, int param1
 void OpenDonationWindow(int client) {
   char steamId[32];
   if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId))) {
-    PrintToChat(client, "[Giveaways] Could not read your SteamID64.");
+    PrintToChat(client, "[SM] No pude leer tu SteamID64.");
     return;
   }
 
@@ -157,7 +166,7 @@ void OpenDonationWindow(int client) {
   char url[512];
   FormatApiUrl("/donations/session", url, sizeof(url));
   if (url[0] == '\0') {
-    PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_base is not set.");
+    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
     return;
   }
 
@@ -182,9 +191,9 @@ void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error
 
   if (error[0] != '\0' || (response.Status != HTTPStatus_Created && response.Status != HTTPStatus_OK)) {
     if (error[0] != '\0') {
-      PrintToChat(client, "[Giveaways] Donation setup failed: %s", error);
+      PrintToChat(client, "[SM] No se pudo preparar la donacion: %s", error);
     } else {
-      PrintToChat(client, "[Giveaways] Donation setup failed (HTTP %d).", response.Status);
+      PrintToChat(client, "[SM] No se pudo preparar la donacion (HTTP %d).", response.Status);
     }
     return;
   }
@@ -202,12 +211,12 @@ void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error
   char profileUrl[512];
   g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
   if (alreadyActive) {
-    PrintToChat(client, "[Giveaways] You already have an active donation window. Use it before opening another.");
+    PrintToChat(client, "[SM] Ya tenes una ventana de donacion activa. Usala antes de abrir otra.");
   } else {
-    PrintToChat(client, "[Giveaways] Donation window opened for 15 minutes.");
+    PrintToChat(client, "[SM] Ventana de donacion abierta por 15 minutos.");
   }
-  PrintToChat(client, "[Giveaways] Add %s and send a trade offer containing only donated items.", profileUrl);
-  PrintToChat(client, "[Giveaways] Put !donate in the trade offer message. Admins will review it before the bot accepts.");
+  PrintToChat(client, "[SM] Agrega a %s y manda una oferta con solo los items que queres donar.", profileUrl);
+  PrintToChat(client, "[SM] Pone !donar o !donate en el mensaje de trade. Si te olvidas de eso, el bot rechaza la oferta. Los admins la revisan antes de que el bot acepte.");
 }
 
 public Action Command_Donations(int client, int args) {
@@ -219,7 +228,7 @@ public Action Command_Donations(int client, int args) {
   char url[512];
   FormatApiUrl("/donations/pending", url, sizeof(url));
   if (url[0] == '\0') {
-    ReplyToCommand(client, "[Giveaways] sm_giveaways_bot_api_base is not set.");
+    ReplyToCommand(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
     return Plugin_Handled;
   }
 
@@ -239,30 +248,30 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
 
   if (error[0] != '\0' || response.Status != HTTPStatus_OK) {
     if (error[0] != '\0') {
-      PrintToChat(client, "[Giveaways] Donation list failed: %s", error);
+      PrintToChat(client, "[SM] No se pudo cargar la lista de donaciones: %s", error);
     } else {
-      PrintToChat(client, "[Giveaways] Donation list failed (HTTP %d).", response.Status);
+      PrintToChat(client, "[SM] No se pudo cargar la lista de donaciones (HTTP %d).", response.Status);
     }
     return;
   }
 
   JSON root = response.Data;
   if (root == null || !IsValidHandle(root)) {
-    PrintToChat(client, "[Giveaways] Donation list response was not valid JSON.");
+    PrintToChat(client, "[SM] La respuesta de donaciones no fue JSON valido.");
     return;
   }
 
   JSONArray arr = view_as<JSONArray>(root);
   if (arr.Length == 0) {
     delete root;
-    PrintToChat(client, "[Giveaways] No donations are pending review.");
+    PrintToChat(client, "[SM] No hay donaciones pendientes de revision.");
     return;
   }
 
   g_DonationOfferIds.Clear();
 
   Menu menu = new Menu(MenuHandler_DonationList);
-  menu.SetTitle("Pending donations");
+  menu.SetTitle("Donaciones pendientes");
 
   for (int i = 0; i < arr.Length; i++) {
     JSON el = arr.Get(i);
@@ -321,7 +330,7 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
 
   if (g_DonationOfferIds.Length == 0) {
     delete menu;
-    PrintToChat(client, "[Giveaways] No usable pending donations were returned.");
+    PrintToChat(client, "[SM] No llegaron donaciones pendientes utilizables.");
     return;
   }
 
@@ -349,9 +358,9 @@ public int MenuHandler_DonationList(Menu menu, MenuAction action, int param1, in
   g_DonationOfferIds.GetString(index, tradeOfferId, sizeof(tradeOfferId));
 
   Menu actions = new Menu(MenuHandler_DonationAction);
-  actions.SetTitle("Donation %s", tradeOfferId);
-  actions.AddItem(tradeOfferId, "Approve and accept trade");
-  actions.AddItem(tradeOfferId, "Reject and decline trade");
+  actions.SetTitle("Donacion %s", tradeOfferId);
+  actions.AddItem(tradeOfferId, "Aprobar y aceptar oferta");
+  actions.AddItem(tradeOfferId, "Rechazar y declinar oferta");
   actions.ExitButton = true;
   actions.Display(param1, MENU_TIME_FOREVER);
   return 0;
@@ -388,7 +397,7 @@ void SendDonationReview(int client, const char[] tradeOfferId, bool approve) {
   char url[512];
   FormatApiUrl(path, url, sizeof(url));
   if (url[0] == '\0') {
-    PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_base is not set.");
+    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
     return;
   }
 
@@ -416,16 +425,16 @@ void OnDonationReviewHttp(HTTPResponse response, any userid, const char[] error)
   }
 
   if (error[0] != '\0') {
-    PrintToChat(client, "[Giveaways] Donation review failed: %s", error);
+    PrintToChat(client, "[SM] Fallo la revision de la donacion: %s", error);
     return;
   }
 
   if (response.Status != HTTPStatus_OK) {
-    PrintToChat(client, "[Giveaways] Donation review failed (HTTP %d).", response.Status);
+    PrintToChat(client, "[SM] Fallo la revision de la donacion (HTTP %d).", response.Status);
     return;
   }
 
-  PrintToChat(client, "[Giveaways] Donation review submitted.");
+  PrintToChat(client, "[SM] Revision de donacion enviada.");
 }
 
 public Action Giveaways_OnGiveawayStart(int client, const char[] prize) {
@@ -439,21 +448,21 @@ public Action Giveaways_OnGiveawayStart(int client, const char[] prize) {
   }
 
   if (g_bHttpInProgress) {
-    PrintToChat(client, "[Giveaways] Inventory request already in progress.");
+    PrintToChat(client, "[SM] Ya hay una consulta de inventario en curso.");
     return Plugin_Handled;
   }
 
   char secret[256];
   g_cvApiSecret.GetString(secret, sizeof(secret));
   if (secret[0] == '\0') {
-    PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_secret is not set.");
+    PrintToChat(client, "[SM] sm_giveaways_bot_api_secret no esta configurado.");
     return Plugin_Handled;
   }
 
   char url[512];
   FormatApiUrl("/inventory?minimal=1", url, sizeof(url));
   if (url[0] == '\0') {
-    PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_base is not set.");
+    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
     return Plugin_Handled;
   }
 
@@ -480,9 +489,9 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
 
   if (status != HTTPStatus_OK) {
     if (error[0] != '\0') {
-      PrintToChat(client, "[Giveaways] HTTP %d - %s", status, error);
+      PrintToChat(client, "[SM] HTTP %d - %s", status, error);
     } else {
-      PrintToChat(client, "[Giveaways] Bot returned HTTP %d.", status);
+      PrintToChat(client, "[SM] El bot respondio HTTP %d.", status);
     }
     return;
   }
@@ -497,18 +506,19 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
     if (error[0] != '\0') {
       LogError("[giveaways_bot] Inventory parse failed (transport: %s)", error);
     }
-    PrintToChat(client, "[Giveaways] Failed to read bot inventory.");
+    PrintToChat(client, "[SM] No pude leer el inventario del bot.");
     return;
   }
 
   int len = arr.Length;
   if (len == 0) {
     delete arr;
-    PrintToChat(client, "[Giveaways] Bot inventory is empty.");
+    PrintToChat(client, "[SM] El inventario del bot esta vacio.");
     return;
   }
 
   g_PrizeStrings.Clear();
+  g_PrizeAssetIds.Clear();
 
   for (int i = 0; i < len; i++) {
     JSON el = arr.Get(i);
@@ -519,46 +529,41 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
 
     char name[256];
     char assetId[128];
-    char donor[128];
     if (!obj.GetString("name", name, sizeof(name))) {
-      strcopy(name, sizeof(name), "Unknown item");
+      strcopy(name, sizeof(name), "Item desconocido");
     }
     if (!obj.GetString("assetId", assetId, sizeof(assetId))) {
       delete el;
       continue;
     }
-    if (!obj.GetString("donorName", donor, sizeof(donor)) || donor[0] == '\0') {
-      obj.GetString("donorSteamId", donor, sizeof(donor));
-    }
-    if (donor[0] != '\0') {
-      char donatedName[256];
-      Format(donatedName, sizeof(donatedName), "%s (donated by %s)", name, donor);
-      strcopy(name, sizeof(name), donatedName);
-    }
-
     SanitizeQuotes(name, sizeof(name));
 
-    char prize[192];
-    FormatPrizeString(name, assetId, prize, sizeof(prize));
-    g_PrizeStrings.PushString(prize);
+    g_PrizeStrings.PushString(name);
+    g_PrizeAssetIds.PushString(assetId);
   }
 
   delete arr;
 
   if (g_PrizeStrings.Length == 0) {
-    PrintToChat(client, "[Giveaways] No usable items in bot inventory.");
+    PrintToChat(client, "[SM] No hay items utilizables en el inventario del bot.");
     return;
   }
 
   Menu menu = new Menu(MenuHandler_Inventory);
-  menu.SetTitle("Select a prize (bot inventory)");
+  menu.SetTitle("Elegir premio (inventario del bot)");
 
   char disp[64];
   char idx[8];
   for (int i = 0; i < g_PrizeStrings.Length; i++) {
     char prize[192];
     g_PrizeStrings.GetString(i, prize, sizeof(prize));
-    SplitPrizeForDisplay(prize, disp, sizeof(disp));
+    strcopy(disp, sizeof(disp), prize);
+    if (strlen(disp) > 48) {
+      disp[45] = '.';
+      disp[46] = '.';
+      disp[47] = '.';
+      disp[48] = '\0';
+    }
     IntToString(i, idx, sizeof(idx));
     menu.AddItem(idx, disp);
   }
@@ -571,43 +576,9 @@ void SanitizeQuotes(char[] s, int maxlen) {
   ReplaceString(s, maxlen, "\"", "'", false);
 }
 
-/** Build "displayName|assetId" and trim so len <= PRIZE_MAX (sm-giveaways g_cPrize[128]). */
-void FormatPrizeString(const char[] name, const char[] assetId, char[] out, int maxlen) {
-  char tmp[384];
-  Format(tmp, sizeof(tmp), "%s|%s", name, assetId);
-  if (strlen(tmp) > PRIZE_MAX) {
-    int overhead = strlen(assetId) + 1;
-    int nameBudget = PRIZE_MAX - overhead;
-    if (nameBudget < 1) {
-      nameBudget = 1;
-    }
-    char shortName[256];
-    strcopy(shortName, sizeof(shortName), name);
-    if (strlen(shortName) > nameBudget) {
-      shortName[nameBudget] = '\0';
-    }
-    Format(out, maxlen, "%s|%s", shortName, assetId);
-  } else {
-    strcopy(out, maxlen, tmp);
-  }
-}
-
-void SplitPrizeForDisplay(const char[] prize, char[] disp, int dispMax) {
-  int pipe = FindCharInString(prize, '|');
-  if (pipe == -1) {
-    strcopy(disp, dispMax, prize);
-    return;
-  }
-  strcopy(disp, dispMax, prize);
-  if (pipe < dispMax) {
-    disp[pipe] = '\0';
-  }
-  if (strlen(disp) > 48) {
-    disp[45] = '.';
-    disp[46] = '.';
-    disp[47] = '.';
-    disp[48] = '\0';
-  }
+void ClearActivePrize() {
+  g_ActivePrizeName[0] = '\0';
+  g_ActiveAssetId[0] = '\0';
 }
 
 public int MenuHandler_Inventory(Menu menu, MenuAction action, int param1, int param2) {
@@ -625,10 +596,12 @@ public int MenuHandler_Inventory(Menu menu, MenuAction action, int param1, int p
   int index = StringToInt(idxStr);
 
   char prize[192];
-  if (index < 0 || index >= g_PrizeStrings.Length) {
+  if (index < 0 || index >= g_PrizeStrings.Length || index >= g_PrizeAssetIds.Length) {
     return 0;
   }
   g_PrizeStrings.GetString(index, prize, sizeof(prize));
+  g_PrizeAssetIds.GetString(index, g_ActiveAssetId, sizeof(g_ActiveAssetId));
+  strcopy(g_ActivePrizeName, sizeof(g_ActivePrizeName), prize);
 
   g_bBotInitiated = true;
 
@@ -638,10 +611,6 @@ public int MenuHandler_Inventory(Menu menu, MenuAction action, int param1, int p
   return 0;
 }
 
-/**
- * sm_gstart is refired as sm_gstart "Name|assetId"; GetCmdArgString keeps the surrounding quotes.
- * Remove one pair of ASCII double quotes so split fields are clean for SQL.
- */
 void StripOuterDoubleQuotes(char[] str, int maxlen) {
   int len = strlen(str);
   if (len < 2) {
@@ -674,10 +643,12 @@ void TrimQuoteEdges(char[] s, int maxlen) {
 
 public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants, const char[] prize) {
   if (participants == 0 || winner < 1 || winner > MaxClients || !IsClientInGame(winner)) {
+    ClearActivePrize();
     return;
   }
 
   if (prize[0] == '\0') {
+    ClearActivePrize();
     return;
   }
 
@@ -685,19 +656,26 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
   strcopy(normalized, sizeof(normalized), prize);
   StripOuterDoubleQuotes(normalized, sizeof(normalized));
 
-  int pipe = FindCharInString(normalized, '|');
-  if (pipe <= 0) {
-    LogMessage("[giveaways_bot] Prize has no '|' separator; skipping delivery record.");
-    return;
-  }
-
   char itemName[512];
   char assetId[256];
-  strcopy(itemName, sizeof(itemName), normalized);
-  if (pipe < sizeof(itemName)) {
-    itemName[pipe] = '\0';
+
+  if (g_ActiveAssetId[0] != '\0' && StrEqual(normalized, g_ActivePrizeName)) {
+    strcopy(itemName, sizeof(itemName), normalized);
+    strcopy(assetId, sizeof(assetId), g_ActiveAssetId);
+  } else {
+    int pipe = FindCharInString(normalized, '|');
+    if (pipe <= 0) {
+      LogMessage("[giveaways_bot] Prize has no tracked asset id; skipping delivery record.");
+      ClearActivePrize();
+      return;
+    }
+
+    strcopy(itemName, sizeof(itemName), normalized);
+    if (pipe < sizeof(itemName)) {
+      itemName[pipe] = '\0';
+    }
+    strcopy(assetId, sizeof(assetId), normalized[pipe + 1]);
   }
-  strcopy(assetId, sizeof(assetId), normalized[pipe + 1]);
 
   TrimQuoteEdges(itemName, sizeof(itemName));
   TrimQuoteEdges(assetId, sizeof(assetId));
@@ -705,6 +683,7 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
   char steamId[32];
   if (!GetClientAuthId(winner, AuthId_SteamID64, steamId, sizeof(steamId))) {
     LogError("[giveaways_bot] GetClientAuthId failed for winner %d", winner);
+    ClearActivePrize();
     return;
   }
 
@@ -712,6 +691,7 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
   g_cvApiSecret.GetString(secret, sizeof(secret));
   if (secret[0] == '\0') {
     PrintWinnerAddBotHint(GetClientUserId(winner));
+    ClearActivePrize();
     return;
   }
 
@@ -719,6 +699,7 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
   FormatApiUrl("/delivery/record", url, sizeof(url));
   if (url[0] == '\0') {
     PrintWinnerAddBotHint(GetClientUserId(winner));
+    ClearActivePrize();
     return;
   }
 
@@ -731,6 +712,12 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
   req.SetHeader("X-Bot-Secret", "%s", secret);
   req.Timeout = 30;
   req.Post(body, OnDeliveryRecordHttp, GetClientUserId(winner));
+  ClearActivePrize();
+}
+
+public Action Giveaways_OnGiveawayCancel(int creator, int cancelator) {
+  ClearActivePrize();
+  return Plugin_Continue;
 }
 
 void OnDeliveryRecordHttp(HTTPResponse response, any userid, const char[] error) {
@@ -762,7 +749,7 @@ void OnDeliveryRecordHttp(HTTPResponse response, any userid, const char[] error)
   if (isFriend) {
     PrintToChat(
       client,
-      "[Giveaways] You're already Steam friends with the bot - a trade offer should arrive shortly; check Steam."
+      "[SM] Ya sos amigo del bot en Steam. La oferta deberia llegar en breve; revisa Steam."
     );
   } else {
     PrintWinnerAddBotHint(userid);
@@ -776,5 +763,5 @@ void PrintWinnerAddBotHint(int winnerUid) {
   }
   char profileUrl[512];
   g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
-  PrintToChat(w, "[Giveaways] Congratulations! Add %s to receive your prize.", profileUrl);
+  PrintToChat(w, "[SM] Felicitaciones! Agrega %s para recibir tu premio.", profileUrl);
 }
