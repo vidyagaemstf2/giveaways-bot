@@ -7,9 +7,10 @@
 #include <giveaways>
 #include <ripext>
 
-#define PLUGIN_VERSION "1.2.0"
+#define PLUGIN_VERSION "1.4"
 #define PRIZE_MAX 127
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
+#define TRADE_OFFER_ID_MAX 64
 
 bool g_bBotInitiated;
 bool g_bHttpInProgress;
@@ -19,9 +20,10 @@ ConVar g_cvApiSecret;
 ConVar g_cvBotProfileUrl;
 
 ArrayList g_PrizeStrings;
+ArrayList g_DonationOfferIds;
 
 public Plugin myinfo = {
-  name = "Giveaways — Steam bot bridge",
+  name = "Giveaways - Steam bot bridge",
   author = "vidya-steam-bot",
   description = "Inventory menu + delivery recording for vidya-steam-bot",
   version = PLUGIN_VERSION,
@@ -50,7 +52,11 @@ public void OnPluginStart() {
 
   AutoExecConfig(true, "giveaways_bot", "sourcemod");
 
+  RegConsoleCmd("sm_donate", Command_Donate, "Open a Steam bot donation window.");
+  RegAdminCmd("sm_gdonations", Command_Donations, ADMFLAG_GENERIC, "Review pending Steam bot donations.");
+
   g_PrizeStrings = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
+  g_DonationOfferIds = new ArrayList(ByteCountToCells(TRADE_OFFER_ID_MAX + 1));
 }
 
 void TrimTrailingSlash(char[] s) {
@@ -72,8 +78,354 @@ void FormatApiUrl(const char[] path, char[] out, int maxlen) {
   Format(out, maxlen, "%s%s", base, path);
 }
 
+bool GetApiSecretOrReply(int client, char[] secret, int maxlen) {
+  g_cvApiSecret.GetString(secret, maxlen);
+  if (secret[0] == '\0') {
+    if (client > 0) {
+      PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_secret is not set.");
+    }
+    return false;
+  }
+  return true;
+}
+
 public void OnPluginEnd() {
   delete g_PrizeStrings;
+  delete g_DonationOfferIds;
+}
+
+public Action Command_Donate(int client, int args) {
+  if (client < 1 || !IsClientInGame(client)) {
+    return Plugin_Handled;
+  }
+
+  ShowDonationConfirmPanel(client);
+  return Plugin_Handled;
+}
+
+void ShowDonationConfirmPanel(int client) {
+  Panel panel = new Panel();
+  panel.SetTitle("Donate items to giveaways?");
+  panel.DrawText(" ");
+  panel.DrawText("You are about to open a 15 minute donation window with the Steam bot.");
+  panel.DrawText(" ");
+  panel.DrawText("What happens next:");
+  panel.DrawText("- Add the bot on Steam if you are not friends.");
+  panel.DrawText("- Send a Steam trade offer with ONLY items you want to donate.");
+  panel.DrawText("- Put !donate in the Steam trade offer message.");
+  panel.DrawText("- Admins will review the offer before the bot accepts it.");
+  panel.DrawText(" ");
+  panel.DrawText("Do not include items you expect to get back.");
+  panel.DrawText(" ");
+  panel.DrawItem("I understand - open donation window");
+  panel.DrawItem("Cancel");
+  panel.Send(client, PanelHandler_DonationConfirm, 45);
+  delete panel;
+}
+
+public int PanelHandler_DonationConfirm(Menu menu, MenuAction action, int param1, int param2) {
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  int client = param1;
+  if (client < 1 || !IsClientInGame(client)) {
+    return 0;
+  }
+
+  if (param2 != 1) {
+    PrintToChat(client, "[Giveaways] Donation cancelled.");
+    return 0;
+  }
+
+  OpenDonationWindow(client);
+  return 0;
+}
+
+void OpenDonationWindow(int client) {
+  char steamId[32];
+  if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId))) {
+    PrintToChat(client, "[Giveaways] Could not read your SteamID64.");
+    return;
+  }
+
+  char secret[256];
+  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
+    return;
+  }
+
+  char url[512];
+  FormatApiUrl("/donations/session", url, sizeof(url));
+  if (url[0] == '\0') {
+    PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_base is not set.");
+    return;
+  }
+
+  char name[MAX_NAME_LENGTH];
+  GetClientName(client, name, sizeof(name));
+
+  JSONObject body = new JSONObject();
+  body.SetString("steamId64", steamId);
+  body.SetString("donorName", name);
+
+  HTTPRequest req = new HTTPRequest(url);
+  req.SetHeader("X-Bot-Secret", "%s", secret);
+  req.Timeout = 30;
+  req.Post(body, OnDonationSessionHttp, GetClientUserId(client));
+}
+
+void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (error[0] != '\0' || (response.Status != HTTPStatus_Created && response.Status != HTTPStatus_OK)) {
+    if (error[0] != '\0') {
+      PrintToChat(client, "[Giveaways] Donation setup failed: %s", error);
+    } else {
+      PrintToChat(client, "[Giveaways] Donation setup failed (HTTP %d).", response.Status);
+    }
+    return;
+  }
+
+  bool alreadyActive = false;
+  JSON root = response.Data;
+  if (root != null && IsValidHandle(root)) {
+    JSONObject obj = view_as<JSONObject>(root);
+    if (obj.HasKey("alreadyActive")) {
+      alreadyActive = obj.GetBool("alreadyActive");
+    }
+    delete root;
+  }
+
+  char profileUrl[512];
+  g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
+  if (alreadyActive) {
+    PrintToChat(client, "[Giveaways] You already have an active donation window. Use it before opening another.");
+  } else {
+    PrintToChat(client, "[Giveaways] Donation window opened for 15 minutes.");
+  }
+  PrintToChat(client, "[Giveaways] Add %s and send a trade offer containing only donated items.", profileUrl);
+  PrintToChat(client, "[Giveaways] Put !donate in the trade offer message. Admins will review it before the bot accepts.");
+}
+
+public Action Command_Donations(int client, int args) {
+  char secret[256];
+  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
+    return Plugin_Handled;
+  }
+
+  char url[512];
+  FormatApiUrl("/donations/pending", url, sizeof(url));
+  if (url[0] == '\0') {
+    ReplyToCommand(client, "[Giveaways] sm_giveaways_bot_api_base is not set.");
+    return Plugin_Handled;
+  }
+
+  HTTPRequest req = new HTTPRequest(url);
+  req.SetHeader("X-Bot-Secret", "%s", secret);
+  req.Timeout = 30;
+  req.Get(OnPendingDonationsHttp, GetClientUserId(client));
+
+  return Plugin_Handled;
+}
+
+void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (error[0] != '\0' || response.Status != HTTPStatus_OK) {
+    if (error[0] != '\0') {
+      PrintToChat(client, "[Giveaways] Donation list failed: %s", error);
+    } else {
+      PrintToChat(client, "[Giveaways] Donation list failed (HTTP %d).", response.Status);
+    }
+    return;
+  }
+
+  JSON root = response.Data;
+  if (root == null || !IsValidHandle(root)) {
+    PrintToChat(client, "[Giveaways] Donation list response was not valid JSON.");
+    return;
+  }
+
+  JSONArray arr = view_as<JSONArray>(root);
+  if (arr.Length == 0) {
+    delete root;
+    PrintToChat(client, "[Giveaways] No donations are pending review.");
+    return;
+  }
+
+  g_DonationOfferIds.Clear();
+
+  Menu menu = new Menu(MenuHandler_DonationList);
+  menu.SetTitle("Pending donations");
+
+  for (int i = 0; i < arr.Length; i++) {
+    JSON el = arr.Get(i);
+    if (el == null || !IsValidHandle(el)) {
+      continue;
+    }
+
+    JSONObject obj = view_as<JSONObject>(el);
+    char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
+    char donor[128];
+    char firstItem[128];
+    tradeOfferId[0] = '\0';
+    donor[0] = '\0';
+    firstItem[0] = '\0';
+
+    obj.GetString("tradeOfferId", tradeOfferId, sizeof(tradeOfferId));
+    if (!obj.GetString("donorName", donor, sizeof(donor)) || donor[0] == '\0') {
+      obj.GetString("donorSteamId", donor, sizeof(donor));
+    }
+
+    int itemCount = 0;
+    JSON itemsJson = obj.Get("items");
+    if (itemsJson != null && IsValidHandle(itemsJson)) {
+      JSONArray items = view_as<JSONArray>(itemsJson);
+      itemCount = items.Length;
+      if (itemCount > 0) {
+        JSON firstJson = items.Get(0);
+        if (firstJson != null && IsValidHandle(firstJson)) {
+          JSONObject first = view_as<JSONObject>(firstJson);
+          first.GetString("name", firstItem, sizeof(firstItem));
+          delete firstJson;
+        }
+      }
+      delete itemsJson;
+    }
+
+    if (tradeOfferId[0] != '\0') {
+      int idx = g_DonationOfferIds.Length;
+      g_DonationOfferIds.PushString(tradeOfferId);
+
+      char idxStr[8];
+      char display[192];
+      IntToString(idx, idxStr, sizeof(idxStr));
+      if (itemCount > 1) {
+        Format(display, sizeof(display), "%s: %s +%d", donor, firstItem, itemCount - 1);
+      } else {
+        Format(display, sizeof(display), "%s: %s", donor, firstItem);
+      }
+      menu.AddItem(idxStr, display);
+    }
+
+    delete el;
+  }
+
+  delete root;
+
+  if (g_DonationOfferIds.Length == 0) {
+    delete menu;
+    PrintToChat(client, "[Giveaways] No usable pending donations were returned.");
+    return;
+  }
+
+  menu.ExitButton = true;
+  menu.Display(client, MENU_TIME_FOREVER);
+}
+
+public int MenuHandler_DonationList(Menu menu, MenuAction action, int param1, int param2) {
+  if (action == MenuAction_End) {
+    delete menu;
+    return 0;
+  }
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  char idxStr[8];
+  menu.GetItem(param2, idxStr, sizeof(idxStr));
+  int index = StringToInt(idxStr);
+  if (index < 0 || index >= g_DonationOfferIds.Length) {
+    return 0;
+  }
+
+  char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
+  g_DonationOfferIds.GetString(index, tradeOfferId, sizeof(tradeOfferId));
+
+  Menu actions = new Menu(MenuHandler_DonationAction);
+  actions.SetTitle("Donation %s", tradeOfferId);
+  actions.AddItem(tradeOfferId, "Approve and accept trade");
+  actions.AddItem(tradeOfferId, "Reject and decline trade");
+  actions.ExitButton = true;
+  actions.Display(param1, MENU_TIME_FOREVER);
+  return 0;
+}
+
+public int MenuHandler_DonationAction(Menu menu, MenuAction action, int param1, int param2) {
+  if (action == MenuAction_End) {
+    delete menu;
+    return 0;
+  }
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
+  menu.GetItem(param2, tradeOfferId, sizeof(tradeOfferId));
+  SendDonationReview(param1, tradeOfferId, param2 == 0);
+  return 0;
+}
+
+void SendDonationReview(int client, const char[] tradeOfferId, bool approve) {
+  char secret[256];
+  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
+    return;
+  }
+
+  char path[160];
+  if (approve) {
+    Format(path, sizeof(path), "/donations/%s/approve", tradeOfferId);
+  } else {
+    Format(path, sizeof(path), "/donations/%s/reject", tradeOfferId);
+  }
+
+  char url[512];
+  FormatApiUrl(path, url, sizeof(url));
+  if (url[0] == '\0') {
+    PrintToChat(client, "[Giveaways] sm_giveaways_bot_api_base is not set.");
+    return;
+  }
+
+  char adminSteamId[32];
+  char adminName[MAX_NAME_LENGTH];
+  if (!GetClientAuthId(client, AuthId_SteamID64, adminSteamId, sizeof(adminSteamId))) {
+    adminSteamId[0] = '\0';
+  }
+  GetClientName(client, adminName, sizeof(adminName));
+
+  JSONObject body = new JSONObject();
+  body.SetString("reviewerSteamId", adminSteamId);
+  body.SetString("reviewerName", adminName);
+
+  HTTPRequest req = new HTTPRequest(url);
+  req.SetHeader("X-Bot-Secret", "%s", secret);
+  req.Timeout = 45;
+  req.Post(body, OnDonationReviewHttp, GetClientUserId(client));
+}
+
+void OnDonationReviewHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (error[0] != '\0') {
+    PrintToChat(client, "[Giveaways] Donation review failed: %s", error);
+    return;
+  }
+
+  if (response.Status != HTTPStatus_OK) {
+    PrintToChat(client, "[Giveaways] Donation review failed (HTTP %d).", response.Status);
+    return;
+  }
+
+  PrintToChat(client, "[Giveaways] Donation review submitted.");
 }
 
 public Action Giveaways_OnGiveawayStart(int client, const char[] prize) {
@@ -128,7 +480,7 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
 
   if (status != HTTPStatus_OK) {
     if (error[0] != '\0') {
-      PrintToChat(client, "[Giveaways] HTTP %d — %s", status, error);
+      PrintToChat(client, "[Giveaways] HTTP %d - %s", status, error);
     } else {
       PrintToChat(client, "[Giveaways] Bot returned HTTP %d.", status);
     }
@@ -167,12 +519,21 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
 
     char name[256];
     char assetId[128];
+    char donor[128];
     if (!obj.GetString("name", name, sizeof(name))) {
       strcopy(name, sizeof(name), "Unknown item");
     }
     if (!obj.GetString("assetId", assetId, sizeof(assetId))) {
       delete el;
       continue;
+    }
+    if (!obj.GetString("donorName", donor, sizeof(donor)) || donor[0] == '\0') {
+      obj.GetString("donorSteamId", donor, sizeof(donor));
+    }
+    if (donor[0] != '\0') {
+      char donatedName[256];
+      Format(donatedName, sizeof(donatedName), "%s (donated by %s)", name, donor);
+      strcopy(name, sizeof(name), donatedName);
     }
 
     SanitizeQuotes(name, sizeof(name));
@@ -401,7 +762,7 @@ void OnDeliveryRecordHttp(HTTPResponse response, any userid, const char[] error)
   if (isFriend) {
     PrintToChat(
       client,
-      "[Giveaways] You're already Steam friends with the bot — a trade offer should arrive shortly; check Steam."
+      "[Giveaways] You're already Steam friends with the bot - a trade offer should arrive shortly; check Steam."
     );
   } else {
     PrintWinnerAddBotHint(userid);
