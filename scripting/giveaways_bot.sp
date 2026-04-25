@@ -11,6 +11,8 @@
 #define PRIZE_MAX 127
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
 #define TRADE_OFFER_ID_MAX 64
+#define DONATION_ITEM_LABEL_MAX 191
+#define DONATION_ITEMS_PER_PANEL 6
 
 bool g_bBotInitiated;
 bool g_bHttpInProgress;
@@ -22,9 +24,16 @@ ConVar g_cvBotProfileUrl;
 ArrayList g_PrizeStrings;
 ArrayList g_PrizeAssetIds;
 ArrayList g_DonationOfferIds;
+ArrayList g_DonationOfferDonors;
+ArrayList g_DonationOfferItemStarts;
+ArrayList g_DonationOfferItemCounts;
+ArrayList g_DonationItemLabels;
 
 char g_ActivePrizeName[256];
 char g_ActiveAssetId[128];
+
+int g_SelectedDonationOffer[MAXPLAYERS + 1];
+int g_SelectedDonationPage[MAXPLAYERS + 1];
 
 public Plugin myinfo = {
   name = "Giveaways - Steam bot bridge",
@@ -65,6 +74,10 @@ public void OnPluginStart() {
   g_PrizeStrings = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
   g_PrizeAssetIds = new ArrayList(ByteCountToCells(128));
   g_DonationOfferIds = new ArrayList(ByteCountToCells(TRADE_OFFER_ID_MAX + 1));
+  g_DonationOfferDonors = new ArrayList(ByteCountToCells(128));
+  g_DonationOfferItemStarts = new ArrayList();
+  g_DonationOfferItemCounts = new ArrayList();
+  g_DonationItemLabels = new ArrayList(ByteCountToCells(DONATION_ITEM_LABEL_MAX + 1));
 }
 
 void TrimTrailingSlash(char[] s) {
@@ -101,6 +114,10 @@ public void OnPluginEnd() {
   delete g_PrizeStrings;
   delete g_PrizeAssetIds;
   delete g_DonationOfferIds;
+  delete g_DonationOfferDonors;
+  delete g_DonationOfferItemStarts;
+  delete g_DonationOfferItemCounts;
+  delete g_DonationItemLabels;
 }
 
 public Action Command_Donate(int client, int args) {
@@ -269,6 +286,10 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
   }
 
   g_DonationOfferIds.Clear();
+  g_DonationOfferDonors.Clear();
+  g_DonationOfferItemStarts.Clear();
+  g_DonationOfferItemCounts.Clear();
+  g_DonationItemLabels.Clear();
 
   Menu menu = new Menu(MenuHandler_DonationList);
   menu.SetTitle("Donaciones pendientes");
@@ -292,18 +313,32 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
       strcopy(donor, sizeof(donor), "Donante sin nombre");
     }
 
+    int itemStart = g_DonationItemLabels.Length;
     int itemCount = 0;
     JSON itemsJson = obj.Get("items");
     if (itemsJson != null && IsValidHandle(itemsJson)) {
       JSONArray items = view_as<JSONArray>(itemsJson);
-      itemCount = items.Length;
-      if (itemCount > 0) {
-        JSON firstJson = items.Get(0);
-        if (firstJson != null && IsValidHandle(firstJson)) {
-          JSONObject first = view_as<JSONObject>(firstJson);
-          first.GetString("name", firstItem, sizeof(firstItem));
-          delete firstJson;
+      for (int itemIndex = 0; itemIndex < items.Length; itemIndex++) {
+        JSON itemJson = items.Get(itemIndex);
+        if (itemJson == null || !IsValidHandle(itemJson)) {
+          continue;
         }
+
+        JSONObject itemObj = view_as<JSONObject>(itemJson);
+        char itemName[128];
+        if (!itemObj.GetString("name", itemName, sizeof(itemName)) || itemName[0] == '\0') {
+          strcopy(itemName, sizeof(itemName), "Item sin nombre");
+        }
+        if (firstItem[0] == '\0') {
+          strcopy(firstItem, sizeof(firstItem), itemName);
+        }
+
+        char itemLabel[DONATION_ITEM_LABEL_MAX + 1];
+        Format(itemLabel, sizeof(itemLabel), "%d. %s", itemCount + 1, itemName);
+        g_DonationItemLabels.PushString(itemLabel);
+        itemCount++;
+
+        delete itemJson;
       }
       delete itemsJson;
     }
@@ -311,10 +346,16 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
     if (tradeOfferId[0] != '\0') {
       int idx = g_DonationOfferIds.Length;
       g_DonationOfferIds.PushString(tradeOfferId);
+      g_DonationOfferDonors.PushString(donor);
+      g_DonationOfferItemStarts.Push(itemStart);
+      g_DonationOfferItemCounts.Push(itemCount);
 
       char idxStr[8];
       char display[192];
       IntToString(idx, idxStr, sizeof(idxStr));
+      if (firstItem[0] == '\0') {
+        strcopy(firstItem, sizeof(firstItem), "Sin items visibles");
+      }
       if (itemCount > 1) {
         Format(display, sizeof(display), "%s: %s +%d", donor, firstItem, itemCount - 1);
       } else {
@@ -354,30 +395,151 @@ public int MenuHandler_DonationList(Menu menu, MenuAction action, int param1, in
     return 0;
   }
 
-  char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
-  g_DonationOfferIds.GetString(index, tradeOfferId, sizeof(tradeOfferId));
-
-  Menu actions = new Menu(MenuHandler_DonationAction);
-  actions.SetTitle("Donacion %s", tradeOfferId);
-  actions.AddItem(tradeOfferId, "Aprobar y aceptar oferta");
-  actions.AddItem(tradeOfferId, "Rechazar y declinar oferta");
-  actions.ExitButton = true;
-  actions.Display(param1, MENU_TIME_FOREVER);
+  ShowDonationReviewPanel(param1, index, 0);
   return 0;
 }
 
-public int MenuHandler_DonationAction(Menu menu, MenuAction action, int param1, int param2) {
-  if (action == MenuAction_End) {
-    delete menu;
-    return 0;
+void ShowDonationReviewPanel(int client, int offerIndex, int page) {
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
   }
+  if (offerIndex < 0 || offerIndex >= g_DonationOfferIds.Length) {
+    PrintToChat(client, "[SM] La donacion seleccionada ya no esta disponible.");
+    return;
+  }
+
+  int itemStart = g_DonationOfferItemStarts.Get(offerIndex);
+  int itemCount = g_DonationOfferItemCounts.Get(offerIndex);
+  int pageCount = 1;
+  if (itemCount > 0) {
+    pageCount = (itemCount + DONATION_ITEMS_PER_PANEL - 1) / DONATION_ITEMS_PER_PANEL;
+  }
+  if (page < 0) {
+    page = 0;
+  }
+  if (page >= pageCount) {
+    page = pageCount - 1;
+  }
+
+  g_SelectedDonationOffer[client] = offerIndex;
+  g_SelectedDonationPage[client] = page;
+
+  char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
+  char donor[128];
+  g_DonationOfferIds.GetString(offerIndex, tradeOfferId, sizeof(tradeOfferId));
+  g_DonationOfferDonors.GetString(offerIndex, donor, sizeof(donor));
+
+  Panel panel = new Panel();
+  panel.SetTitle("Revision de donacion");
+  panel.DrawText(" ");
+
+  char line[256];
+  Format(line, sizeof(line), "Donante: %s", donor);
+  panel.DrawText(line);
+  Format(line, sizeof(line), "Oferta: %s", tradeOfferId);
+  panel.DrawText(line);
+  Format(line, sizeof(line), "Items: %d", itemCount);
+  panel.DrawText(line);
+  panel.DrawText(" ");
+
+  if (itemCount == 0) {
+    panel.DrawText("- No hay items registrados en esta oferta.");
+  } else {
+    Format(line, sizeof(line), "Pagina %d/%d", page + 1, pageCount);
+    panel.DrawText(line);
+
+    int firstItem = page * DONATION_ITEMS_PER_PANEL;
+    int lastItem = firstItem + DONATION_ITEMS_PER_PANEL;
+    if (lastItem > itemCount) {
+      lastItem = itemCount;
+    }
+
+    for (int itemIndex = firstItem; itemIndex < lastItem; itemIndex++) {
+      char itemLabel[DONATION_ITEM_LABEL_MAX + 1];
+      g_DonationItemLabels.GetString(itemStart + itemIndex, itemLabel, sizeof(itemLabel));
+      panel.DrawText(itemLabel);
+    }
+  }
+
+  bool hasNext = (page + 1) < pageCount;
+  panel.DrawText(" ");
+  if (hasNext) {
+    panel.DrawText("Revisa todas las paginas antes de decidir.");
+  }
+  if (page > 0) {
+    panel.DrawItem("Pagina anterior");
+  }
+  if (hasNext) {
+    panel.DrawItem("Ver mas items");
+  } else {
+    panel.DrawItem("Aprobar y aceptar oferta");
+    panel.DrawItem("Rechazar y declinar oferta");
+  }
+  panel.DrawItem("Volver a donaciones");
+  panel.DrawText(" ");
+  panel.Send(client, PanelHandler_DonationReview, MENU_TIME_FOREVER);
+  delete panel;
+}
+
+public int PanelHandler_DonationReview(Menu menu, MenuAction action, int param1, int param2) {
   if (action != MenuAction_Select) {
     return 0;
   }
 
-  char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
-  menu.GetItem(param2, tradeOfferId, sizeof(tradeOfferId));
-  SendDonationReview(param1, tradeOfferId, param2 == 0);
+  int client = param1;
+  if (client < 1 || !IsClientInGame(client)) {
+    return 0;
+  }
+
+  int offerIndex = g_SelectedDonationOffer[client];
+  if (offerIndex < 0 || offerIndex >= g_DonationOfferIds.Length) {
+    PrintToChat(client, "[SM] La donacion seleccionada ya no esta disponible.");
+    return 0;
+  }
+
+  int page = g_SelectedDonationPage[client];
+  int itemCount = g_DonationOfferItemCounts.Get(offerIndex);
+  int pageCount = 1;
+  if (itemCount > 0) {
+    pageCount = (itemCount + DONATION_ITEMS_PER_PANEL - 1) / DONATION_ITEMS_PER_PANEL;
+  }
+  bool hasNext = (page + 1) < pageCount;
+
+  int button = 1;
+  if (page > 0) {
+    if (param2 == button) {
+      ShowDonationReviewPanel(client, offerIndex, page - 1);
+      return 0;
+    }
+    button++;
+  }
+
+  if (hasNext) {
+    if (param2 == button) {
+      ShowDonationReviewPanel(client, offerIndex, page + 1);
+      return 0;
+    }
+    button++;
+  } else {
+    char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
+    g_DonationOfferIds.GetString(offerIndex, tradeOfferId, sizeof(tradeOfferId));
+
+    if (param2 == button) {
+      SendDonationReview(client, tradeOfferId, true);
+      return 0;
+    }
+    button++;
+
+    if (param2 == button) {
+      SendDonationReview(client, tradeOfferId, false);
+      return 0;
+    }
+    button++;
+  }
+
+  if (param2 == button) {
+    Command_Donations(client, 0);
+  }
   return 0;
 }
 
@@ -617,7 +779,7 @@ public int MenuHandler_Inventory(Menu menu, MenuAction action, int param1, int p
   return 0;
 }
 
-void StripOuterDoubleQuotes(char[] str, int maxlen) {
+void StripOuterDoubleQuotes(char[] str) {
   int len = strlen(str);
   if (len < 2) {
     return;
@@ -632,7 +794,7 @@ void StripOuterDoubleQuotes(char[] str, int maxlen) {
 }
 
 /** After split: g_cPrize can be truncated without a closing quote; trim stray " on each field. */
-void TrimQuoteEdges(char[] s, int maxlen) {
+void TrimQuoteEdges(char[] s) {
   int n = 0;
   while ((n = strlen(s)) > 0 && s[0] == '"') {
     for (int i = 0; i < n; i++) {
@@ -660,7 +822,7 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
 
   char normalized[192];
   strcopy(normalized, sizeof(normalized), prize);
-  StripOuterDoubleQuotes(normalized, sizeof(normalized));
+  StripOuterDoubleQuotes(normalized);
 
   char itemName[512];
   char assetId[256];
@@ -683,8 +845,8 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
     strcopy(assetId, sizeof(assetId), normalized[pipe + 1]);
   }
 
-  TrimQuoteEdges(itemName, sizeof(itemName));
-  TrimQuoteEdges(assetId, sizeof(assetId));
+  TrimQuoteEdges(itemName);
+  TrimQuoteEdges(assetId);
 
   char steamId[32];
   if (!GetClientAuthId(winner, AuthId_SteamID64, steamId, sizeof(steamId))) {
