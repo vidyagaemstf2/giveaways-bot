@@ -289,7 +289,7 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
 
     obj.GetString("tradeOfferId", tradeOfferId, sizeof(tradeOfferId));
     if (!obj.GetString("donorName", donor, sizeof(donor)) || donor[0] == '\0') {
-      obj.GetString("donorSteamId", donor, sizeof(donor));
+      strcopy(donor, sizeof(donor), "Donante sin nombre");
     }
 
     int itemCount = 0;
@@ -529,12 +529,18 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
 
     char name[256];
     char assetId[128];
+    char donor[128];
     if (!obj.GetString("name", name, sizeof(name))) {
       strcopy(name, sizeof(name), "Item desconocido");
     }
     if (!obj.GetString("assetId", assetId, sizeof(assetId))) {
       delete el;
       continue;
+    }
+    if (obj.GetString("donorName", donor, sizeof(donor)) && donor[0] != '\0') {
+      char donatedName[256];
+      Format(donatedName, sizeof(donatedName), "%s (donado por %s)", name, donor);
+      strcopy(name, sizeof(name), donatedName);
     }
     SanitizeQuotes(name, sizeof(name));
 
