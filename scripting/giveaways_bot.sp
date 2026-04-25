@@ -138,7 +138,8 @@ void ShowDonationConfirmPanel(int client) {
   panel.DrawText("Que pasa despues:");
   panel.DrawText("- Agrega al bot en Steam si todavia no son amigos.");
   panel.DrawText("- Manda una oferta con SOLO los items que queres donar.");
-  panel.DrawText("- Pone !donar o !donate en el mensaje de la oferta.");
+  panel.DrawText("- Durante esta ventana no hace falta mensaje especial.");
+  panel.DrawText("- Si mandas una oferta directa sin ventana, usa !donar en el mensaje.");
   panel.DrawText("- Un admin va a revisar la oferta antes de que el bot la acepte.");
   panel.DrawText(" ");
   panel.DrawText("No incluyas items que esperas recuperar.");
@@ -233,7 +234,7 @@ void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error
     PrintToChat(client, "[SM] Ventana de donacion abierta por 15 minutos.");
   }
   PrintToChat(client, "[SM] Agrega a %s y manda una oferta con solo los items que queres donar.", profileUrl);
-  PrintToChat(client, "[SM] Pone !donar o !donate en el mensaje de trade. Si te olvidas de eso, el bot rechaza la oferta. Los admins la revisan antes de que el bot acepte.");
+  PrintToChat(client, "[SM] Durante esta ventana no hace falta poner !donar en el trade. Si mandas una oferta directa sin ventana activa, ahi si usa !donar o !donate.");
 }
 
 public Action Command_Donations(int client, int args) {
