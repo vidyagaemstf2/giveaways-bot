@@ -19,6 +19,7 @@
 int g_WizardMode[MAXPLAYERS + 1];
 bool g_SelectedItem[MAXPLAYERS + 1][MAX_ITEMS];
 char g_SendTargetSteamId[MAXPLAYERS + 1][32];
+char g_SendTargetName[MAXPLAYERS + 1][MAX_NAME_LENGTH];
 
 bool g_bHttpInProgress;
 bool g_bDonationPromptServed[MAXPLAYERS + 1];
@@ -75,7 +76,7 @@ public void OnPluginStart() {
   RegAdminCmd("sm_donaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonations", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
-  RegAdminCmd("sm_gsend", Command_GsendTarget, ADMFLAG_GENERIC, "Enviar item(s) del inventario del bot a un jugador. Uso: sm_gsend <steamid64>");
+  RegAdminCmd("sm_gsend", Command_GsendTarget, ADMFLAG_GENERIC, "Enviar item(s) del inventario del bot a un jugador. Uso: sm_gsend <jugador | @me>");
 
   HookEvent("post_inventory_application", Event_PostInventoryApplication, EventHookMode_Post);
 
@@ -106,6 +107,7 @@ public void OnClientDisconnect(int client) {
   g_bDonationPromptServed[client] = false;
   g_WizardMode[client] = 0;
   g_SendTargetSteamId[client][0] = '\0';
+  g_SendTargetName[client][0] = '\0';
   for (int i = 0; i < MAX_ITEMS; i++) {
     g_SelectedItem[client][i] = false;
   }
@@ -149,14 +151,6 @@ void SanitizeQuotes(char[] s, int maxlen) {
   ReplaceString(s, maxlen, "\"", "'", false);
 }
 
-bool IsValidSteamId64(const char[] s) {
-  int len = strlen(s);
-  if (len < 17 || len > 19) return false;
-  for (int i = 0; i < len; i++) {
-    if (s[i] < '0' || s[i] > '9') return false;
-  }
-  return true;
-}
 
 void ResetClientSelection(int client) {
   for (int i = 0; i < MAX_ITEMS; i++) {
@@ -464,18 +458,44 @@ public Action Command_GsendTarget(int client, int args) {
   }
 
   if (args < 1) {
-    ReplyToCommand(client, "[SM] Uso: sm_gsend <steamid64>");
+    ReplyToCommand(client, "[SM] Uso: sm_gsend <jugador>");
+    return Plugin_Handled;
+  }
+
+  char targetStr[64];
+  GetCmdArg(1, targetStr, sizeof(targetStr));
+
+  char resolvedName[MAX_NAME_LENGTH];
+  int targets[1];
+  bool tnIsMl;
+  int count = ProcessTargetString(
+    targetStr, client, targets, 1,
+    COMMAND_FILTER_NO_MULTI | COMMAND_FILTER_NO_BOTS,
+    resolvedName, sizeof(resolvedName), tnIsMl
+  );
+
+  if (count <= 0) {
+    ReplyToCommand(client, "[SM] Jugador no encontrado o target invalido (no se permiten targets multiples).");
+    return Plugin_Handled;
+  }
+
+  int target = targets[0];
+  if (!IsClientInGame(target)) {
+    ReplyToCommand(client, "[SM] El jugador ya no esta en el servidor.");
     return Plugin_Handled;
   }
 
   char steamId[32];
-  GetCmdArg(1, steamId, sizeof(steamId));
-  if (!IsValidSteamId64(steamId)) {
-    ReplyToCommand(client, "[SM] SteamID64 invalido. Debe tener 17-19 digitos.");
+  if (!GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId))) {
+    ReplyToCommand(client, "[SM] No pude obtener el SteamID64 del jugador.");
     return Plugin_Handled;
   }
 
+  char playerName[MAX_NAME_LENGTH];
+  GetClientName(target, playerName, sizeof(playerName));
+
   strcopy(g_SendTargetSteamId[client], sizeof(g_SendTargetSteamId[]), steamId);
+  strcopy(g_SendTargetName[client], sizeof(g_SendTargetName[]), playerName);
   g_WizardMode[client] = 2;
   FetchInventoryForClient(client);
 
@@ -487,7 +507,12 @@ void ShowGsendSummaryPanel(int client) {
 
   Panel panel = new Panel();
   char title[64];
-  Format(title, sizeof(title), "Enviar a %s", g_SendTargetSteamId[client]);
+  char displayName[MAX_NAME_LENGTH];
+  if (g_SendTargetName[client][0] != '\0')
+    strcopy(displayName, sizeof(displayName), g_SendTargetName[client]);
+  else
+    strcopy(displayName, sizeof(displayName), g_SendTargetSteamId[client]);
+  Format(title, sizeof(title), "Enviar a %s", displayName);
   panel.SetTitle(title);
   panel.DrawText(" ");
 
