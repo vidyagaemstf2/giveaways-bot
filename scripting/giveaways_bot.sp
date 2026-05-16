@@ -7,15 +7,21 @@
 #include <giveaways>
 #include <ripext>
 
-#define PLUGIN_VERSION "1.5"
+#define PLUGIN_VERSION "2.0.0"
 #define PRIZE_MAX 127
+#define MAX_ITEMS 256
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
 #define TRADE_OFFER_ID_MAX 64
 #define DONATION_ITEM_LABEL_MAX 191
 #define DONATION_ITEMS_PER_PANEL 6
 
-bool g_bBotInitiated;
+// Wizard mode: 0 = none, 1 = gstart, 2 = gsend
+int g_WizardMode[MAXPLAYERS + 1];
+bool g_SelectedItem[MAXPLAYERS + 1][MAX_ITEMS];
+char g_SendTargetSteamId[MAXPLAYERS + 1][32];
+
 bool g_bHttpInProgress;
+bool g_bDonationPromptServed[MAXPLAYERS + 1];
 
 ConVar g_cvApiBase;
 ConVar g_cvApiSecret;
@@ -23,14 +29,13 @@ ConVar g_cvBotProfileUrl;
 
 ArrayList g_PrizeStrings;
 ArrayList g_PrizeAssetIds;
+ArrayList g_TrackedPrizeNames;
+ArrayList g_TrackedAssetIds;
 ArrayList g_DonationOfferIds;
 ArrayList g_DonationOfferDonors;
 ArrayList g_DonationOfferItemStarts;
 ArrayList g_DonationOfferItemCounts;
 ArrayList g_DonationItemLabels;
-
-char g_ActivePrizeName[256];
-char g_ActiveAssetId[128];
 
 int g_SelectedDonationOffer[MAXPLAYERS + 1];
 int g_SelectedDonationPage[MAXPLAYERS + 1];
@@ -70,15 +75,45 @@ public void OnPluginStart() {
   RegAdminCmd("sm_donaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonations", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
+  RegAdminCmd("sm_gsend", Command_GsendTarget, ADMFLAG_GENERIC, "Enviar item(s) del inventario del bot a un jugador. Uso: sm_gsend <steamid64>");
+
+  HookEvent("post_inventory_application", Event_PostInventoryApplication, EventHookMode_Post);
 
   g_PrizeStrings = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
   g_PrizeAssetIds = new ArrayList(ByteCountToCells(128));
+  g_TrackedPrizeNames = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
+  g_TrackedAssetIds = new ArrayList(ByteCountToCells(128));
   g_DonationOfferIds = new ArrayList(ByteCountToCells(TRADE_OFFER_ID_MAX + 1));
   g_DonationOfferDonors = new ArrayList(ByteCountToCells(128));
   g_DonationOfferItemStarts = new ArrayList();
   g_DonationOfferItemCounts = new ArrayList();
   g_DonationItemLabels = new ArrayList(ByteCountToCells(DONATION_ITEM_LABEL_MAX + 1));
 }
+
+public void OnPluginEnd() {
+  delete g_PrizeStrings;
+  delete g_PrizeAssetIds;
+  delete g_TrackedPrizeNames;
+  delete g_TrackedAssetIds;
+  delete g_DonationOfferIds;
+  delete g_DonationOfferDonors;
+  delete g_DonationOfferItemStarts;
+  delete g_DonationOfferItemCounts;
+  delete g_DonationItemLabels;
+}
+
+public void OnClientDisconnect(int client) {
+  g_bDonationPromptServed[client] = false;
+  g_WizardMode[client] = 0;
+  g_SendTargetSteamId[client][0] = '\0';
+  for (int i = 0; i < MAX_ITEMS; i++) {
+    g_SelectedItem[client][i] = false;
+  }
+  g_SelectedDonationOffer[client] = -1;
+  g_SelectedDonationPage[client] = 0;
+}
+
+/* ─── Shared helpers ─────────────────────────────────────────────────────── */
 
 void TrimTrailingSlash(char[] s) {
   int len = strlen(s);
@@ -110,14 +145,499 @@ bool GetApiSecretOrReply(int client, char[] secret, int maxlen) {
   return true;
 }
 
-public void OnPluginEnd() {
-  delete g_PrizeStrings;
-  delete g_PrizeAssetIds;
-  delete g_DonationOfferIds;
-  delete g_DonationOfferDonors;
-  delete g_DonationOfferItemStarts;
-  delete g_DonationOfferItemCounts;
-  delete g_DonationItemLabels;
+void SanitizeQuotes(char[] s, int maxlen) {
+  ReplaceString(s, maxlen, "\"", "'", false);
+}
+
+bool IsValidSteamId64(const char[] s) {
+  int len = strlen(s);
+  if (len < 17 || len > 19) return false;
+  for (int i = 0; i < len; i++) {
+    if (s[i] < '0' || s[i] > '9') return false;
+  }
+  return true;
+}
+
+void ResetClientSelection(int client) {
+  for (int i = 0; i < MAX_ITEMS; i++) {
+    g_SelectedItem[client][i] = false;
+  }
+}
+
+int CountClientSelection(int client) {
+  int n = 0;
+  int limit = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
+  for (int i = 0; i < limit; i++) {
+    if (g_SelectedItem[client][i]) n++;
+  }
+  return n;
+}
+
+/* ─── Inventory fetch ────────────────────────────────────────────────────── */
+
+void FetchInventoryForClient(int client) {
+  if (g_bHttpInProgress) {
+    PrintToChat(client, "[SM] Ya hay una consulta de inventario en curso.");
+    g_WizardMode[client] = 0;
+    return;
+  }
+
+  char secret[256];
+  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
+    g_WizardMode[client] = 0;
+    return;
+  }
+
+  char url[512];
+  FormatApiUrl("/inventory?minimal=1", url, sizeof(url));
+  if (url[0] == '\0') {
+    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
+    g_WizardMode[client] = 0;
+    return;
+  }
+
+  g_bHttpInProgress = true;
+
+  char path[PLATFORM_MAX_PATH];
+  BuildPath(Path_SM, path, sizeof(path), INVENTORY_FILE);
+
+  HTTPRequest req = new HTTPRequest(url);
+  req.SetHeader("X-Bot-Secret", "%s", secret);
+  req.Timeout = 30;
+  req.DownloadFile(path, OnInventoryFile, GetClientUserId(client));
+}
+
+void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
+  g_bHttpInProgress = false;
+
+  int client = GetClientOfUserId(userid);
+  if (!client || !IsClientInGame(client)) {
+    return;
+  }
+
+  int mode = g_WizardMode[client];
+  if (mode == 0) {
+    return;
+  }
+
+  if (status != HTTPStatus_OK) {
+    if (error[0] != '\0') {
+      PrintToChat(client, "[SM] HTTP %d - %s", status, error);
+    }
+    else {
+      PrintToChat(client, "[SM] El bot respondio HTTP %d.", status);
+    }
+    g_WizardMode[client] = 0;
+    return;
+  }
+
+  char path[PLATFORM_MAX_PATH];
+  BuildPath(Path_SM, path, sizeof(path), INVENTORY_FILE);
+
+  JSONArray arr = JSONArray.FromFile(path);
+  DeleteFile(path);
+
+  if (arr == null) {
+    PrintToChat(client, "[SM] No pude leer el inventario del bot.");
+    g_WizardMode[client] = 0;
+    return;
+  }
+
+  int len = arr.Length;
+  if (len == 0) {
+    delete arr;
+    PrintToChat(client, "[SM] El inventario del bot esta vacio.");
+    g_WizardMode[client] = 0;
+    return;
+  }
+
+  g_PrizeStrings.Clear();
+  g_PrizeAssetIds.Clear();
+
+  for (int i = 0; i < len; i++) {
+    JSON el = arr.Get(i);
+    if (el == null || !IsValidHandle(el)) {
+      continue;
+    }
+    JSONObject obj = view_as<JSONObject>(el);
+
+    char name[PRIZE_MAX + 1];
+    char assetId[128];
+    char donor[128];
+    if (!obj.GetString("name", name, sizeof(name))) {
+      strcopy(name, sizeof(name), "Item desconocido");
+    }
+    if (!obj.GetString("assetId", assetId, sizeof(assetId))) {
+      delete el;
+      continue;
+    }
+    if (obj.GetString("donorName", donor, sizeof(donor)) && donor[0] != '\0') {
+      char donatedName[PRIZE_MAX + 1];
+      Format(donatedName, sizeof(donatedName), "%s (donado por %s)", name, donor);
+      strcopy(name, sizeof(name), donatedName);
+    }
+    SanitizeQuotes(name, sizeof(name));
+
+    g_PrizeStrings.PushString(name);
+    g_PrizeAssetIds.PushString(assetId);
+
+    delete el;
+  }
+
+  delete arr;
+
+  if (g_PrizeStrings.Length == 0) {
+    PrintToChat(client, "[SM] No hay items utilizables en el inventario del bot.");
+    g_WizardMode[client] = 0;
+    return;
+  }
+
+  ResetClientSelection(client);
+  OpenCheckboxMenu(client);
+}
+
+/* ─── Checkbox multi-select menu ─────────────────────────────────────────── */
+
+void OpenCheckboxMenu(int client) {
+  int nSelected = CountClientSelection(client);
+  int itemCount = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
+
+  Menu menu = new Menu(MenuHandler_Checkbox);
+
+  char confirmLabel[64];
+  Format(confirmLabel, sizeof(confirmLabel), "Confirmar (%d seleccionados)", nSelected);
+  menu.AddItem("confirm", confirmLabel, nSelected > 0 ? ITEMDRAW_DEFAULT : ITEMDRAW_DISABLED);
+
+  for (int i = 0; i < itemCount; i++) {
+    char name[PRIZE_MAX + 1];
+    g_PrizeStrings.GetString(i, name, sizeof(name));
+
+    char label[PRIZE_MAX + 6];
+    Format(label, sizeof(label), "%s %s", g_SelectedItem[client][i] ? "[x]" : "[ ]", name);
+    if (strlen(label) > 62) {
+      label[59] = '.';
+      label[60] = '.';
+      label[61] = '.';
+      label[62] = '\0';
+    }
+
+    char key[8];
+    IntToString(i, key, sizeof(key));
+    menu.AddItem(key, label);
+  }
+
+  menu.ExitButton = true;
+  menu.Display(client, MENU_TIME_FOREVER);
+}
+
+public int MenuHandler_Checkbox(Menu menu, MenuAction action, int param1, int param2) {
+  if (action == MenuAction_End) {
+    delete menu;
+    return 0;
+  }
+  if (action == MenuAction_Cancel) {
+    g_WizardMode[param1] = 0;
+    return 0;
+  }
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  int client = param1;
+  char key[8];
+  menu.GetItem(param2, key, sizeof(key));
+
+  if (StrEqual(key, "confirm")) {
+    int mode = g_WizardMode[client];
+    if (mode == 1) {
+      ShowGstartSummaryPanel(client);
+    }
+    else if (mode == 2) {
+      ShowGsendSummaryPanel(client);
+    }
+    return 0;
+  }
+
+  int idx = StringToInt(key);
+  if (idx >= 0 && idx < MAX_ITEMS) {
+    g_SelectedItem[client][idx] = !g_SelectedItem[client][idx];
+  }
+
+  OpenCheckboxMenu(client);
+  return 0;
+}
+
+/* ─── gstart wizard ──────────────────────────────────────────────────────── */
+
+void ShowGstartSummaryPanel(int client) {
+  int nSelected = CountClientSelection(client);
+
+  Panel panel = new Panel();
+  char title[64];
+  Format(title, sizeof(title), "Sorteo: %d ganador(es)", nSelected);
+  panel.SetTitle(title);
+  panel.DrawText(" ");
+  panel.DrawText("Premios:");
+  panel.DrawText(" ");
+
+  int count = 0;
+  int limit = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
+  for (int i = 0; i < limit; i++) {
+    if (!g_SelectedItem[client][i]) continue;
+    char prize[PRIZE_MAX + 1];
+    g_PrizeStrings.GetString(i, prize, sizeof(prize));
+    char line[80];
+    Format(line, sizeof(line), "%d. %s", count + 1, prize);
+    if (strlen(line) > 63) {
+      line[60] = '.'; line[61] = '.'; line[62] = '.'; line[63] = '\0';
+    }
+    panel.DrawText(line);
+    count++;
+    if (count >= 10) {
+      panel.DrawText("...");
+      break;
+    }
+  }
+
+  panel.DrawText(" ");
+  panel.DrawItem("Iniciar sorteo");
+  panel.DrawItem("Cancelar");
+
+  panel.Send(client, PanelHandler_GstartSummary, MENU_TIME_FOREVER);
+  delete panel;
+}
+
+public int PanelHandler_GstartSummary(Menu menu, MenuAction action, int param1, int param2) {
+  if (action != MenuAction_Select) {
+    if (action == MenuAction_Cancel) {
+      g_WizardMode[param1] = 0;
+    }
+    return 0;
+  }
+
+  int client = param1;
+
+  if (param2 == 2) {
+    g_WizardMode[client] = 0;
+    return 0;
+  }
+
+  int nSelected = CountClientSelection(client);
+  if (nSelected == 0) {
+    PrintToChat(client, "[SM] No seleccionaste ningun item.");
+    g_WizardMode[client] = 0;
+    return 0;
+  }
+
+  g_TrackedPrizeNames.Clear();
+  g_TrackedAssetIds.Clear();
+
+  char argsStr[1024];
+  Format(argsStr, sizeof(argsStr), "%d", nSelected);
+
+  int limit = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
+  for (int i = 0; i < limit; i++) {
+    if (!g_SelectedItem[client][i]) continue;
+    char prize[PRIZE_MAX + 1];
+    char assetId[128];
+    g_PrizeStrings.GetString(i, prize, sizeof(prize));
+    g_PrizeAssetIds.GetString(i, assetId, sizeof(assetId));
+
+    g_TrackedPrizeNames.PushString(prize);
+    g_TrackedAssetIds.PushString(assetId);
+
+    SanitizeQuotes(prize, sizeof(prize));
+    Format(argsStr, sizeof(argsStr), "%s \"%s\"", argsStr, prize);
+  }
+
+  g_WizardMode[client] = 0;
+
+  FakeClientCommand(client, "sm_gstart_now %s", argsStr);
+  return 0;
+}
+
+/* ─── sm_gsend wizard ────────────────────────────────────────────────────── */
+
+public Action Command_GsendTarget(int client, int args) {
+  if (client < 1 || !IsClientInGame(client)) {
+    return Plugin_Handled;
+  }
+
+  if (args < 1) {
+    ReplyToCommand(client, "[SM] Uso: sm_gsend <steamid64>");
+    return Plugin_Handled;
+  }
+
+  char steamId[32];
+  GetCmdArg(1, steamId, sizeof(steamId));
+  if (!IsValidSteamId64(steamId)) {
+    ReplyToCommand(client, "[SM] SteamID64 invalido. Debe tener 17-19 digitos.");
+    return Plugin_Handled;
+  }
+
+  strcopy(g_SendTargetSteamId[client], sizeof(g_SendTargetSteamId[]), steamId);
+  g_WizardMode[client] = 2;
+  FetchInventoryForClient(client);
+
+  return Plugin_Handled;
+}
+
+void ShowGsendSummaryPanel(int client) {
+  int nSelected = CountClientSelection(client);
+
+  Panel panel = new Panel();
+  char title[64];
+  Format(title, sizeof(title), "Enviar a %s", g_SendTargetSteamId[client]);
+  panel.SetTitle(title);
+  panel.DrawText(" ");
+
+  char headerLine[64];
+  Format(headerLine, sizeof(headerLine), "Enviando %d item(s):", nSelected);
+  panel.DrawText(headerLine);
+  panel.DrawText(" ");
+
+  int count = 0;
+  int limit = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
+  for (int i = 0; i < limit; i++) {
+    if (!g_SelectedItem[client][i]) continue;
+    char prize[PRIZE_MAX + 1];
+    g_PrizeStrings.GetString(i, prize, sizeof(prize));
+    char line[80];
+    Format(line, sizeof(line), "%d. %s", count + 1, prize);
+    if (strlen(line) > 63) {
+      line[60] = '.'; line[61] = '.'; line[62] = '.'; line[63] = '\0';
+    }
+    panel.DrawText(line);
+    count++;
+    if (count >= 10) {
+      panel.DrawText("...");
+      break;
+    }
+  }
+
+  panel.DrawText(" ");
+  panel.DrawItem("Enviar");
+  panel.DrawItem("Cancelar");
+
+  panel.Send(client, PanelHandler_GsendSummary, MENU_TIME_FOREVER);
+  delete panel;
+}
+
+public int PanelHandler_GsendSummary(Menu menu, MenuAction action, int param1, int param2) {
+  if (action != MenuAction_Select) {
+    if (action == MenuAction_Cancel) {
+      g_WizardMode[param1] = 0;
+    }
+    return 0;
+  }
+
+  int client = param1;
+
+  if (param2 == 2) {
+    g_WizardMode[client] = 0;
+    return 0;
+  }
+
+  int nSelected = CountClientSelection(client);
+  if (nSelected == 0) {
+    PrintToChat(client, "[SM] No seleccionaste ningun item.");
+    g_WizardMode[client] = 0;
+    return 0;
+  }
+
+  char secret[256];
+  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
+    g_WizardMode[client] = 0;
+    return 0;
+  }
+
+  char url[512];
+  FormatApiUrl("/delivery/admin-send", url, sizeof(url));
+  if (url[0] == '\0') {
+    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
+    g_WizardMode[client] = 0;
+    return 0;
+  }
+
+  JSONObject body = new JSONObject();
+  body.SetString("winnerSteamId", g_SendTargetSteamId[client]);
+
+  JSONArray items = new JSONArray();
+  int limit = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
+  for (int i = 0; i < limit; i++) {
+    if (!g_SelectedItem[client][i]) continue;
+    char prize[PRIZE_MAX + 1];
+    char assetId[128];
+    g_PrizeStrings.GetString(i, prize, sizeof(prize));
+    g_PrizeAssetIds.GetString(i, assetId, sizeof(assetId));
+
+    JSONObject item = new JSONObject();
+    item.SetString("assetId", assetId);
+    item.SetString("itemName", prize);
+    items.Push(item);
+    delete item;
+  }
+  body.Set("items", items);
+  delete items;
+
+  g_WizardMode[client] = 0;
+
+  HTTPRequest req = new HTTPRequest(url);
+  req.SetHeader("X-Bot-Secret", "%s", secret);
+  req.Timeout = 30;
+  req.Post(body, OnAdminSendHttp, GetClientUserId(client));
+  delete body;
+
+  return 0;
+}
+
+void OnAdminSendHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (error[0] != '\0') {
+    PrintToChat(client, "[SM] Error al enviar entrega: %s", error);
+    return;
+  }
+
+  if (response.Status != HTTPStatus_Created && response.Status != HTTPStatus_OK) {
+    PrintToChat(client, "[SM] Fallo la entrega (HTTP %d).", response.Status);
+    return;
+  }
+
+  int count = 0;
+  JSON root = response.Data;
+  if (root != null && IsValidHandle(root)) {
+    JSONObject obj = view_as<JSONObject>(root);
+    if (obj.HasKey("count")) {
+      count = obj.GetInt("count");
+    }
+    delete root;
+  }
+
+  PrintToChat(client, "[SM] Entrega registrada: %d item(s) en cola.", count);
+}
+
+/* ─── Donation management ────────────────────────────────────────────────── */
+
+public void Event_PostInventoryApplication(Event event, const char[] name, bool dontBroadcast) {
+  int client = GetClientOfUserId(event.GetInt("userid"));
+  if (client < 1 || !IsClientInGame(client) || IsFakeClient(client)) {
+    return;
+  }
+
+  if (g_bDonationPromptServed[client]) {
+    return;
+  }
+
+  if (!CheckCommandAccess(client, "sm_gdonations", ADMFLAG_GENERIC)) {
+    return;
+  }
+
+  g_bDonationPromptServed[client] = true;
+  CheckPendingDonationsForPrompt(client);
 }
 
 public Action Command_Donate(int client, int args) {
@@ -199,6 +719,7 @@ void OpenDonationWindow(int client) {
   req.SetHeader("X-Bot-Secret", "%s", secret);
   req.Timeout = 30;
   req.Post(body, OnDonationSessionHttp, GetClientUserId(client));
+  delete body;
 }
 
 void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error) {
@@ -210,7 +731,8 @@ void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error
   if (error[0] != '\0' || (response.Status != HTTPStatus_Created && response.Status != HTTPStatus_OK)) {
     if (error[0] != '\0') {
       PrintToChat(client, "[SM] No se pudo preparar la donacion: %s", error);
-    } else {
+    }
+    else {
       PrintToChat(client, "[SM] No se pudo preparar la donacion (HTTP %d).", response.Status);
     }
     return;
@@ -230,7 +752,8 @@ void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error
   g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
   if (alreadyActive) {
     PrintToChat(client, "[SM] Ya tenes una ventana de donacion activa. Usala antes de abrir otra.");
-  } else {
+  }
+  else {
     PrintToChat(client, "[SM] Ventana de donacion abierta por 15 minutos.");
   }
   PrintToChat(client, "[SM] Agrega a %s y manda una oferta con solo los items que queres donar.", profileUrl);
@@ -258,6 +781,24 @@ public Action Command_Donations(int client, int args) {
   return Plugin_Handled;
 }
 
+void CheckPendingDonationsForPrompt(int client) {
+  char secret[256];
+  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
+    return;
+  }
+
+  char url[512];
+  FormatApiUrl("/donations/pending", url, sizeof(url));
+  if (url[0] == '\0') {
+    return;
+  }
+
+  HTTPRequest req = new HTTPRequest(url);
+  req.SetHeader("X-Bot-Secret", "%s", secret);
+  req.Timeout = 30;
+  req.Get(OnPendingDonationPromptHttp, GetClientUserId(client));
+}
+
 void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] error) {
   int client = GetClientOfUserId(userid);
   if (client < 1 || !IsClientInGame(client)) {
@@ -267,7 +808,8 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
   if (error[0] != '\0' || response.Status != HTTPStatus_OK) {
     if (error[0] != '\0') {
       PrintToChat(client, "[SM] No se pudo cargar la lista de donaciones: %s", error);
-    } else {
+    }
+    else {
       PrintToChat(client, "[SM] No se pudo cargar la lista de donaciones (HTTP %d).", response.Status);
     }
     return;
@@ -286,14 +828,53 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
     return;
   }
 
+  if (!LoadPendingDonationData(arr)) {
+    delete root;
+    PrintToChat(client, "[SM] No llegaron donaciones pendientes utilizables.");
+    return;
+  }
+
+  delete root;
+  DisplayDonationListMenu(client);
+}
+
+void OnPendingDonationPromptHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (error[0] != '\0' || response.Status != HTTPStatus_OK) {
+    return;
+  }
+
+  JSON root = response.Data;
+  if (root == null || !IsValidHandle(root)) {
+    return;
+  }
+
+  JSONArray arr = view_as<JSONArray>(root);
+  if (arr.Length == 0) {
+    delete root;
+    return;
+  }
+
+  if (!LoadPendingDonationData(arr)) {
+    delete root;
+    return;
+  }
+
+  int pendingCount = g_DonationOfferIds.Length;
+  delete root;
+  ShowPendingDonationPrompt(client, pendingCount);
+}
+
+bool LoadPendingDonationData(JSONArray arr) {
   g_DonationOfferIds.Clear();
   g_DonationOfferDonors.Clear();
   g_DonationOfferItemStarts.Clear();
   g_DonationOfferItemCounts.Clear();
   g_DonationItemLabels.Clear();
-
-  Menu menu = new Menu(MenuHandler_DonationList);
-  menu.SetTitle("Donaciones pendientes");
 
   for (int i = 0; i < arr.Length; i++) {
     JSON el = arr.Get(i);
@@ -304,10 +885,8 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
     JSONObject obj = view_as<JSONObject>(el);
     char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
     char donor[128];
-    char firstItem[128];
     tradeOfferId[0] = '\0';
     donor[0] = '\0';
-    firstItem[0] = '\0';
 
     obj.GetString("tradeOfferId", tradeOfferId, sizeof(tradeOfferId));
     if (!obj.GetString("donorName", donor, sizeof(donor)) || donor[0] == '\0') {
@@ -330,9 +909,6 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
         if (!itemObj.GetString("name", itemName, sizeof(itemName)) || itemName[0] == '\0') {
           strcopy(itemName, sizeof(itemName), "Item sin nombre");
         }
-        if (firstItem[0] == '\0') {
-          strcopy(firstItem, sizeof(firstItem), itemName);
-        }
 
         char itemLabel[DONATION_ITEM_LABEL_MAX + 1];
         Format(itemLabel, sizeof(itemLabel), "%d. %s", itemCount + 1, itemName);
@@ -345,39 +921,92 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
     }
 
     if (tradeOfferId[0] != '\0') {
-      int idx = g_DonationOfferIds.Length;
       g_DonationOfferIds.PushString(tradeOfferId);
       g_DonationOfferDonors.PushString(donor);
       g_DonationOfferItemStarts.Push(itemStart);
       g_DonationOfferItemCounts.Push(itemCount);
-
-      char idxStr[8];
-      char display[192];
-      IntToString(idx, idxStr, sizeof(idxStr));
-      if (firstItem[0] == '\0') {
-        strcopy(firstItem, sizeof(firstItem), "Sin items visibles");
-      }
-      if (itemCount > 1) {
-        Format(display, sizeof(display), "%s: %s +%d", donor, firstItem, itemCount - 1);
-      } else {
-        Format(display, sizeof(display), "%s: %s", donor, firstItem);
-      }
-      menu.AddItem(idxStr, display);
     }
 
     delete el;
   }
 
-  delete root;
+  return g_DonationOfferIds.Length > 0;
+}
 
+void DisplayDonationListMenu(int client) {
   if (g_DonationOfferIds.Length == 0) {
-    delete menu;
     PrintToChat(client, "[SM] No llegaron donaciones pendientes utilizables.");
     return;
   }
 
+  Menu menu = new Menu(MenuHandler_DonationList);
+  menu.SetTitle("Donaciones pendientes");
+
+  for (int i = 0; i < g_DonationOfferIds.Length; i++) {
+    char idxStr[8];
+    char display[192];
+    char donor[128];
+    char firstItem[128];
+
+    int itemStart = g_DonationOfferItemStarts.Get(i);
+    int itemCount = g_DonationOfferItemCounts.Get(i);
+
+    IntToString(i, idxStr, sizeof(idxStr));
+    g_DonationOfferDonors.GetString(i, donor, sizeof(donor));
+
+    if (itemCount > 0) {
+      g_DonationItemLabels.GetString(itemStart, firstItem, sizeof(firstItem));
+    }
+    else {
+      strcopy(firstItem, sizeof(firstItem), "Sin items visibles");
+    }
+
+    if (itemCount > 1) {
+      Format(display, sizeof(display), "%s: %s +%d", donor, firstItem, itemCount - 1);
+    }
+    else {
+      Format(display, sizeof(display), "%s: %s", donor, firstItem);
+    }
+    menu.AddItem(idxStr, display);
+  }
+
   menu.ExitButton = true;
   menu.Display(client, MENU_TIME_FOREVER);
+}
+
+void ShowPendingDonationPrompt(int client, int pendingCount) {
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  Panel panel = new Panel();
+  panel.SetTitle("Donaciones pendientes");
+  panel.DrawText(" ");
+
+  char line[128];
+  Format(line, sizeof(line), "Hay %d donaciones pendientes de revision.", pendingCount);
+  panel.DrawText(line);
+  panel.DrawText(" ");
+  panel.DrawItem("Revisar ahora");
+  panel.DrawItem("Mas tarde");
+  panel.Send(client, PanelHandler_PendingDonationPrompt, 30);
+  delete panel;
+}
+
+public int PanelHandler_PendingDonationPrompt(Menu menu, MenuAction action, int param1, int param2) {
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  int client = param1;
+  if (client < 1 || !IsClientInGame(client)) {
+    return 0;
+  }
+
+  if (param2 == 1) {
+    DisplayDonationListMenu(client);
+  }
+  return 0;
 }
 
 public int MenuHandler_DonationList(Menu menu, MenuAction action, int param1, int param2) {
@@ -445,7 +1074,8 @@ void ShowDonationReviewPanel(int client, int offerIndex, int page) {
 
   if (itemCount == 0) {
     panel.DrawText("- No hay items registrados en esta oferta.");
-  } else {
+  }
+  else {
     Format(line, sizeof(line), "Pagina %d/%d", page + 1, pageCount);
     panel.DrawText(line);
 
@@ -472,7 +1102,8 @@ void ShowDonationReviewPanel(int client, int offerIndex, int page) {
   }
   if (hasNext) {
     panel.DrawItem("Ver mas items");
-  } else {
+  }
+  else {
     panel.DrawItem("Aprobar y aceptar oferta");
     panel.DrawItem("Rechazar y declinar oferta");
   }
@@ -521,7 +1152,8 @@ public int PanelHandler_DonationReview(Menu menu, MenuAction action, int param1,
       return 0;
     }
     button++;
-  } else {
+  }
+  else {
     char tradeOfferId[TRADE_OFFER_ID_MAX + 1];
     g_DonationOfferIds.GetString(offerIndex, tradeOfferId, sizeof(tradeOfferId));
 
@@ -553,7 +1185,8 @@ void SendDonationReview(int client, const char[] tradeOfferId, bool approve) {
   char path[160];
   if (approve) {
     Format(path, sizeof(path), "/donations/%s/approve", tradeOfferId);
-  } else {
+  }
+  else {
     Format(path, sizeof(path), "/donations/%s/reject", tradeOfferId);
   }
 
@@ -579,6 +1212,7 @@ void SendDonationReview(int client, const char[] tradeOfferId, bool approve) {
   req.SetHeader("X-Bot-Secret", "%s", secret);
   req.Timeout = 45;
   req.Post(body, OnDonationReviewHttp, GetClientUserId(client));
+  delete body;
 }
 
 void OnDonationReviewHttp(HTTPResponse response, any userid, const char[] error) {
@@ -600,259 +1234,65 @@ void OnDonationReviewHttp(HTTPResponse response, any userid, const char[] error)
   PrintToChat(client, "[SM] Revision de donacion enviada.");
 }
 
-public Action Giveaways_OnGiveawayStart(int client, const char[] prize) {
-  if (g_bBotInitiated) {
-    g_bBotInitiated = false;
-    return Plugin_Continue;
-  }
+/* ─── Giveaway forwards ──────────────────────────────────────────────────── */
 
+public Action Giveaways_OnGiveawayStart(int client, const char[] prize) {
   if (prize[0] != '\0') {
     return Plugin_Continue;
   }
 
-  if (g_bHttpInProgress) {
-    PrintToChat(client, "[SM] Ya hay una consulta de inventario en curso.");
-    return Plugin_Handled;
-  }
-
-  char secret[256];
-  g_cvApiSecret.GetString(secret, sizeof(secret));
-  if (secret[0] == '\0') {
-    PrintToChat(client, "[SM] sm_giveaways_bot_api_secret no esta configurado.");
-    return Plugin_Handled;
-  }
-
-  char url[512];
-  FormatApiUrl("/inventory?minimal=1", url, sizeof(url));
-  if (url[0] == '\0') {
-    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
-    return Plugin_Handled;
-  }
-
-  g_bHttpInProgress = true;
-
-  char path[PLATFORM_MAX_PATH];
-  BuildPath(Path_SM, path, sizeof(path), INVENTORY_FILE);
-
-  HTTPRequest req = new HTTPRequest(url);
-  req.SetHeader("X-Bot-Secret", "%s", secret);
-  req.Timeout = 30;
-  req.DownloadFile(path, OnInventoryFile, GetClientUserId(client));
-
+  g_WizardMode[client] = 1;
+  FetchInventoryForClient(client);
   return Plugin_Handled;
-}
-
-void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
-  g_bHttpInProgress = false;
-
-  int client = GetClientOfUserId(userid);
-  if (!client || !IsClientInGame(client)) {
-    return;
-  }
-
-  if (status != HTTPStatus_OK) {
-    if (error[0] != '\0') {
-      PrintToChat(client, "[SM] HTTP %d - %s", status, error);
-    } else {
-      PrintToChat(client, "[SM] El bot respondio HTTP %d.", status);
-    }
-    return;
-  }
-
-  char path[PLATFORM_MAX_PATH];
-  BuildPath(Path_SM, path, sizeof(path), INVENTORY_FILE);
-
-  JSONArray arr = JSONArray.FromFile(path);
-  DeleteFile(path);
-
-  if (arr == null) {
-    if (error[0] != '\0') {
-      LogError("[giveaways_bot] Inventory parse failed (transport: %s)", error);
-    }
-    PrintToChat(client, "[SM] No pude leer el inventario del bot.");
-    return;
-  }
-
-  int len = arr.Length;
-  if (len == 0) {
-    delete arr;
-    PrintToChat(client, "[SM] El inventario del bot esta vacio.");
-    return;
-  }
-
-  g_PrizeStrings.Clear();
-  g_PrizeAssetIds.Clear();
-
-  for (int i = 0; i < len; i++) {
-    JSON el = arr.Get(i);
-    if (el == null || !IsValidHandle(el)) {
-      continue;
-    }
-    JSONObject obj = view_as<JSONObject>(el);
-
-    char name[256];
-    char assetId[128];
-    char donor[128];
-    if (!obj.GetString("name", name, sizeof(name))) {
-      strcopy(name, sizeof(name), "Item desconocido");
-    }
-    if (!obj.GetString("assetId", assetId, sizeof(assetId))) {
-      delete el;
-      continue;
-    }
-    if (obj.GetString("donorName", donor, sizeof(donor)) && donor[0] != '\0') {
-      char donatedName[256];
-      Format(donatedName, sizeof(donatedName), "%s (donado por %s)", name, donor);
-      strcopy(name, sizeof(name), donatedName);
-    }
-    SanitizeQuotes(name, sizeof(name));
-
-    g_PrizeStrings.PushString(name);
-    g_PrizeAssetIds.PushString(assetId);
-  }
-
-  delete arr;
-
-  if (g_PrizeStrings.Length == 0) {
-    PrintToChat(client, "[SM] No hay items utilizables en el inventario del bot.");
-    return;
-  }
-
-  Menu menu = new Menu(MenuHandler_Inventory);
-  menu.SetTitle("Elegir premio (inventario del bot)");
-
-  char disp[64];
-  char idx[8];
-  for (int i = 0; i < g_PrizeStrings.Length; i++) {
-    char prize[192];
-    g_PrizeStrings.GetString(i, prize, sizeof(prize));
-    strcopy(disp, sizeof(disp), prize);
-    if (strlen(disp) > 48) {
-      disp[45] = '.';
-      disp[46] = '.';
-      disp[47] = '.';
-      disp[48] = '\0';
-    }
-    IntToString(i, idx, sizeof(idx));
-    menu.AddItem(idx, disp);
-  }
-
-  menu.ExitButton = true;
-  menu.Display(client, MENU_TIME_FOREVER);
-}
-
-void SanitizeQuotes(char[] s, int maxlen) {
-  ReplaceString(s, maxlen, "\"", "'", false);
-}
-
-void ClearActivePrize() {
-  g_ActivePrizeName[0] = '\0';
-  g_ActiveAssetId[0] = '\0';
-}
-
-public int MenuHandler_Inventory(Menu menu, MenuAction action, int param1, int param2) {
-  if (action == MenuAction_End) {
-    delete menu;
-    return 0;
-  }
-  if (action != MenuAction_Select) {
-    return 0;
-  }
-
-  int client = param1;
-  char idxStr[8];
-  menu.GetItem(param2, idxStr, sizeof(idxStr));
-  int index = StringToInt(idxStr);
-
-  char prize[192];
-  if (index < 0 || index >= g_PrizeStrings.Length || index >= g_PrizeAssetIds.Length) {
-    return 0;
-  }
-  g_PrizeStrings.GetString(index, prize, sizeof(prize));
-  g_PrizeAssetIds.GetString(index, g_ActiveAssetId, sizeof(g_ActiveAssetId));
-  strcopy(g_ActivePrizeName, sizeof(g_ActivePrizeName), prize);
-
-  g_bBotInitiated = true;
-
-  char cmd[256];
-  Format(cmd, sizeof(cmd), "sm_gstart \"%s\"", prize);
-  FakeClientCommand(client, cmd);
-  return 0;
-}
-
-void StripOuterDoubleQuotes(char[] str) {
-  int len = strlen(str);
-  if (len < 2) {
-    return;
-  }
-  if (str[0] != '"' || str[len - 1] != '"') {
-    return;
-  }
-  for (int i = 1; i < len - 1; i++) {
-    str[i - 1] = str[i];
-  }
-  str[len - 2] = '\0';
-}
-
-/** After split: g_cPrize can be truncated without a closing quote; trim stray " on each field. */
-void TrimQuoteEdges(char[] s) {
-  int n = 0;
-  while ((n = strlen(s)) > 0 && s[0] == '"') {
-    for (int i = 0; i < n; i++) {
-      s[i] = s[i + 1];
-    }
-  }
-  TrimString(s);
-  n = strlen(s);
-  while (n > 0 && s[n - 1] == '"') {
-    s[n - 1] = '\0';
-    n--;
-  }
 }
 
 public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants, const char[] prize) {
   if (participants == 0 || winner < 1 || winner > MaxClients || !IsClientInGame(winner)) {
-    ClearActivePrize();
     return;
   }
 
   if (prize[0] == '\0') {
-    ClearActivePrize();
     return;
   }
 
-  char normalized[192];
+  char normalized[PRIZE_MAX + 1];
   strcopy(normalized, sizeof(normalized), prize);
-  StripOuterDoubleQuotes(normalized);
 
-  char itemName[512];
-  char assetId[256];
+  char assetId[128];
+  bool found = false;
 
-  if (g_ActiveAssetId[0] != '\0' && StrEqual(normalized, g_ActivePrizeName)) {
-    strcopy(itemName, sizeof(itemName), normalized);
-    strcopy(assetId, sizeof(assetId), g_ActiveAssetId);
-  } else {
-    int pipe = FindCharInString(normalized, '|');
-    if (pipe <= 0) {
-      LogMessage("[giveaways_bot] Prize has no tracked asset id; skipping delivery record.");
-      ClearActivePrize();
-      return;
+  for (int i = 0; i < g_TrackedPrizeNames.Length; i++) {
+    char trackedName[PRIZE_MAX + 1];
+    g_TrackedPrizeNames.GetString(i, trackedName, sizeof(trackedName));
+    if (StrEqual(normalized, trackedName, false)) {
+      g_TrackedAssetIds.GetString(i, assetId, sizeof(assetId));
+      g_TrackedPrizeNames.Erase(i);
+      g_TrackedAssetIds.Erase(i);
+      found = true;
+      break;
     }
-
-    strcopy(itemName, sizeof(itemName), normalized);
-    if (pipe < sizeof(itemName)) {
-      itemName[pipe] = '\0';
-    }
-    strcopy(assetId, sizeof(assetId), normalized[pipe + 1]);
   }
 
-  TrimQuoteEdges(itemName);
-  TrimQuoteEdges(assetId);
+  char itemName[PRIZE_MAX + 1];
+  if (found) {
+    strcopy(itemName, sizeof(itemName), normalized);
+  }
+  else {
+    int pipe = FindCharInString(normalized, '|');
+    if (pipe <= 0) {
+      LogMessage("[giveaways_bot] No tracked asset id for prize '%s'; skipping delivery record.", normalized);
+      return;
+    }
+    strcopy(itemName, sizeof(itemName), normalized);
+    itemName[pipe] = '\0';
+    strcopy(assetId, sizeof(assetId), normalized[pipe + 1]);
+    TrimQuoteEdges(itemName);
+    TrimQuoteEdges(assetId);
+  }
 
   char steamId[32];
   if (!GetClientAuthId(winner, AuthId_SteamID64, steamId, sizeof(steamId))) {
     LogError("[giveaways_bot] GetClientAuthId failed for winner %d", winner);
-    ClearActivePrize();
     return;
   }
 
@@ -860,7 +1300,6 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
   g_cvApiSecret.GetString(secret, sizeof(secret));
   if (secret[0] == '\0') {
     PrintWinnerAddBotHint(GetClientUserId(winner));
-    ClearActivePrize();
     return;
   }
 
@@ -868,7 +1307,6 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
   FormatApiUrl("/delivery/record", url, sizeof(url));
   if (url[0] == '\0') {
     PrintWinnerAddBotHint(GetClientUserId(winner));
-    ClearActivePrize();
     return;
   }
 
@@ -881,11 +1319,12 @@ public void Giveaways_OnGiveawayEnded(int creator, int winner, int participants,
   req.SetHeader("X-Bot-Secret", "%s", secret);
   req.Timeout = 30;
   req.Post(body, OnDeliveryRecordHttp, GetClientUserId(winner));
-  ClearActivePrize();
+  delete body;
 }
 
 public Action Giveaways_OnGiveawayCancel(int creator, int cancelator) {
-  ClearActivePrize();
+  g_TrackedPrizeNames.Clear();
+  g_TrackedAssetIds.Clear();
   return Plugin_Continue;
 }
 
@@ -916,11 +1355,9 @@ void OnDeliveryRecordHttp(HTTPResponse response, any userid, const char[] error)
   }
 
   if (isFriend) {
-    PrintToChat(
-      client,
-      "[SM] Ya sos amigo del bot en Steam. La oferta deberia llegar en breve; revisa Steam."
-    );
-  } else {
+    PrintToChat(client, "[SM] Ya sos amigo del bot en Steam. La oferta deberia llegar en breve; revisa Steam.");
+  }
+  else {
     PrintWinnerAddBotHint(userid);
   }
 }
@@ -933,4 +1370,19 @@ void PrintWinnerAddBotHint(int winnerUid) {
   char profileUrl[512];
   g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
   PrintToChat(w, "[SM] Felicitaciones! Agrega %s para recibir tu premio.", profileUrl);
+}
+
+void TrimQuoteEdges(char[] s) {
+  int n = 0;
+  while ((n = strlen(s)) > 0 && s[0] == '"') {
+    for (int i = 0; i < n; i++) {
+      s[i] = s[i + 1];
+    }
+  }
+  TrimString(s);
+  n = strlen(s);
+  while (n > 0 && s[n - 1] == '"') {
+    s[n - 1] = '\0';
+    n--;
+  }
 }
