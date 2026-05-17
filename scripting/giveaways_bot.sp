@@ -6,8 +6,9 @@
 
 #include <giveaways>
 #include <ripext>
+#include <morecolors>
 
-#define PLUGIN_VERSION "2.0.0"
+#define PLUGIN_VERSION "2.0.1"
 #define PRIZE_MAX 127
 #define MAX_ITEMS 256
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
@@ -44,7 +45,7 @@ int g_SelectedDonationPage[MAXPLAYERS + 1];
 public Plugin myinfo = {
   name = "Giveaways - Steam bot bridge",
   author = "ampere",
-  description = "Menu de inventario y registro de entregas para vidya-steam-bot",
+  description = "Menú de inventario y registro de entregas para vidya-steam-bot",
   version = PLUGIN_VERSION,
   url = "https://github.com/vidyagaemstf2/giveaways-bot"
 };
@@ -55,7 +56,7 @@ public void OnPluginStart() {
   g_cvApiBase = CreateConVar(
     "sm_giveaways_bot_api_base",
     "http://127.0.0.1:3000",
-    "URL base de la API HTTP del bot de Steam (sin barra final). Se agregan automaticamente rutas como /inventory y /delivery/record."
+    "URL base de la API HTTP del bot de Steam (sin barra final). Se agregan automáticamente rutas como /inventory y /delivery/record."
   );
   g_cvApiSecret = CreateConVar(
     "sm_giveaways_bot_api_secret",
@@ -71,8 +72,8 @@ public void OnPluginStart() {
 
   AutoExecConfig(true, "giveaways_bot", "sourcemod");
 
-  RegConsoleCmd("sm_donar", Command_Donate, "Abrir una ventana de donacion con el bot de Steam.");
-  RegConsoleCmd("sm_donate", Command_Donate, "Abrir una ventana de donacion con el bot de Steam.");
+  RegConsoleCmd("sm_donar", Command_Donate, "Abrir una ventana de donación con el bot de Steam.");
+  RegConsoleCmd("sm_donate", Command_Donate, "Abrir una ventana de donación con el bot de Steam.");
   RegAdminCmd("sm_donaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonations", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
@@ -140,12 +141,13 @@ bool GetApiSecretOrReply(int client, char[] secret, int maxlen) {
   g_cvApiSecret.GetString(secret, maxlen);
   if (secret[0] == '\0') {
     if (client > 0) {
-      PrintToChat(client, "[SM] sm_giveaways_bot_api_secret no esta configurado.");
+      MC_PrintToChat(client, "[SM] {red}sm_giveaways_bot_api_secret no está configurado.");
     }
     return false;
   }
   return true;
 }
+
 
 void SanitizeQuotes(char[] s, int maxlen) {
   ReplaceString(s, maxlen, "\"", "'", false);
@@ -171,7 +173,7 @@ int CountClientSelection(int client) {
 
 void FetchInventoryForClient(int client) {
   if (g_bHttpInProgress) {
-    PrintToChat(client, "[SM] Ya hay una consulta de inventario en curso.");
+    MC_PrintToChat(client, "[SM] {orange}Ya hay una consulta de inventario en curso.");
     g_WizardMode[client] = 0;
     return;
   }
@@ -185,12 +187,13 @@ void FetchInventoryForClient(int client) {
   char url[512];
   FormatApiUrl("/inventory?minimal=1", url, sizeof(url));
   if (url[0] == '\0') {
-    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
+    MC_PrintToChat(client, "[SM] {red}sm_giveaways_bot_api_base no está configurado.");
     g_WizardMode[client] = 0;
     return;
   }
 
   g_bHttpInProgress = true;
+  MC_PrintToChat(client, "[SM] {grey}Cargando inventario del bot…");
 
   char path[PLATFORM_MAX_PATH];
   BuildPath(Path_SM, path, sizeof(path), INVENTORY_FILE);
@@ -216,10 +219,10 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
 
   if (status != HTTPStatus_OK) {
     if (error[0] != '\0') {
-      PrintToChat(client, "[SM] HTTP %d - %s", status, error);
+      MC_PrintToChat(client, "[SM] {red}Error al cargar el inventario (HTTP %d): %s", status, error);
     }
     else {
-      PrintToChat(client, "[SM] El bot respondio HTTP %d.", status);
+      MC_PrintToChat(client, "[SM] {red}El bot respondió HTTP %d.", status);
     }
     g_WizardMode[client] = 0;
     return;
@@ -232,7 +235,7 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
   DeleteFile(path);
 
   if (arr == null) {
-    PrintToChat(client, "[SM] No pude leer el inventario del bot.");
+    MC_PrintToChat(client, "[SM] {red}No pude leer el inventario del bot.");
     g_WizardMode[client] = 0;
     return;
   }
@@ -240,7 +243,7 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
   int len = arr.Length;
   if (len == 0) {
     delete arr;
-    PrintToChat(client, "[SM] El inventario del bot esta vacio.");
+    MC_PrintToChat(client, "[SM] {orange}El inventario del bot está vacío.");
     g_WizardMode[client] = 0;
     return;
   }
@@ -281,7 +284,7 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
   delete arr;
 
   if (g_PrizeStrings.Length == 0) {
-    PrintToChat(client, "[SM] No hay items utilizables en el inventario del bot.");
+    MC_PrintToChat(client, "[SM] {orange}No hay ítems utilizables en el inventario del bot.");
     g_WizardMode[client] = 0;
     return;
   }
@@ -418,7 +421,7 @@ public int PanelHandler_GstartSummary(Menu menu, MenuAction action, int param1, 
 
   int nSelected = CountClientSelection(client);
   if (nSelected == 0) {
-    PrintToChat(client, "[SM] No seleccionaste ningun item.");
+    MC_PrintToChat(client, "[SM] {orange}No seleccionaste ningún ítem.");
     g_WizardMode[client] = 0;
     return 0;
   }
@@ -458,7 +461,7 @@ public Action Command_GsendTarget(int client, int args) {
   }
 
   if (args < 1) {
-    ReplyToCommand(client, "[SM] Uso: sm_gsend <jugador>");
+    MC_ReplyToCommand(client, "[SM] {green}Uso: sm_gsend <jugador>");
     return Plugin_Handled;
   }
 
@@ -475,19 +478,19 @@ public Action Command_GsendTarget(int client, int args) {
   );
 
   if (count <= 0) {
-    ReplyToCommand(client, "[SM] Jugador no encontrado o target invalido (no se permiten targets multiples).");
+    MC_ReplyToCommand(client, "[SM] {red}Jugador no encontrado o target inválido (no se permiten targets múltiples).");
     return Plugin_Handled;
   }
 
   int target = targets[0];
   if (!IsClientInGame(target)) {
-    ReplyToCommand(client, "[SM] El jugador ya no esta en el servidor.");
+    MC_ReplyToCommand(client, "[SM] {red}El jugador ya no está en el servidor.");
     return Plugin_Handled;
   }
 
   char steamId[32];
   if (!GetClientAuthId(target, AuthId_SteamID64, steamId, sizeof(steamId))) {
-    ReplyToCommand(client, "[SM] No pude obtener el SteamID64 del jugador.");
+    MC_ReplyToCommand(client, "[SM] {red}No pude obtener el SteamID64 del jugador.");
     return Plugin_Handled;
   }
 
@@ -565,7 +568,7 @@ public int PanelHandler_GsendSummary(Menu menu, MenuAction action, int param1, i
 
   int nSelected = CountClientSelection(client);
   if (nSelected == 0) {
-    PrintToChat(client, "[SM] No seleccionaste ningun item.");
+    MC_PrintToChat(client, "[SM] {orange}No seleccionaste ningún ítem.");
     g_WizardMode[client] = 0;
     return 0;
   }
@@ -579,7 +582,7 @@ public int PanelHandler_GsendSummary(Menu menu, MenuAction action, int param1, i
   char url[512];
   FormatApiUrl("/delivery/admin-send", url, sizeof(url));
   if (url[0] == '\0') {
-    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
+    MC_PrintToChat(client, "[SM] {red}sm_giveaways_bot_api_base no está configurado.");
     g_WizardMode[client] = 0;
     return 0;
   }
@@ -606,6 +609,7 @@ public int PanelHandler_GsendSummary(Menu menu, MenuAction action, int param1, i
   delete items;
 
   g_WizardMode[client] = 0;
+  MC_PrintToChat(client, "[SM] {grey}Enviando entrega al bot…");
 
   HTTPRequest req = new HTTPRequest(url);
   req.SetHeader("X-Bot-Secret", "%s", secret);
@@ -623,12 +627,12 @@ void OnAdminSendHttp(HTTPResponse response, any userid, const char[] error) {
   }
 
   if (error[0] != '\0') {
-    PrintToChat(client, "[SM] Error al enviar entrega: %s", error);
+    MC_PrintToChat(client, "[SM] {red}Error al enviar entrega: %s", error);
     return;
   }
 
   if (response.Status != HTTPStatus_Created && response.Status != HTTPStatus_OK) {
-    PrintToChat(client, "[SM] Fallo la entrega (HTTP %d).", response.Status);
+    MC_PrintToChat(client, "[SM] {red}Falló la entrega (HTTP %d).", response.Status);
     return;
   }
 
@@ -642,7 +646,7 @@ void OnAdminSendHttp(HTTPResponse response, any userid, const char[] error) {
     delete root;
   }
 
-  PrintToChat(client, "[SM] Entrega registrada: %d item(s) en cola.", count);
+  MC_PrintToChat(client, "[SM] {green}Entrega registrada: %d ítem(s) en cola.", count);
 }
 
 /* ─── Donation management ────────────────────────────────────────────────── */
@@ -678,14 +682,14 @@ void ShowDonationConfirmPanel(int client) {
   Panel panel = new Panel();
   panel.SetTitle("Donar items a los sorteos?");
   panel.DrawText(" ");
-  panel.DrawText("Estas por abrir una ventana de donacion de 15 minutos con el bot de Steam.");
+  panel.DrawText("Estas por abrir una ventana de donacion de 15 min con el bot de Steam.");
   panel.DrawText(" ");
   panel.DrawText("Que pasa despues:");
   panel.DrawText("- Agrega al bot en Steam si todavia no son amigos.");
   panel.DrawText("- Manda una oferta con SOLO los items que queres donar.");
   panel.DrawText("- Durante esta ventana no hace falta mensaje especial.");
-  panel.DrawText("- Si mandas una oferta directa sin ventana, usa !donar en el mensaje.");
-  panel.DrawText("- Un admin va a revisar la oferta antes de que el bot la acepte.");
+  panel.DrawText("- Si mandas una oferta directa sin ventana, usa !donar.");
+  panel.DrawText("- Un admin va a revisar la oferta antes de aceptarla.");
   panel.DrawText(" ");
   panel.DrawText("No incluyas items que esperas recuperar.");
   panel.DrawText(" ");
@@ -706,7 +710,7 @@ public int PanelHandler_DonationConfirm(Menu menu, MenuAction action, int param1
   }
 
   if (param2 != 1) {
-    PrintToChat(client, "[SM] Donacion cancelada.");
+    MC_PrintToChat(client, "[SM] {grey}Donación cancelada.");
     return 0;
   }
 
@@ -717,7 +721,7 @@ public int PanelHandler_DonationConfirm(Menu menu, MenuAction action, int param1
 void OpenDonationWindow(int client) {
   char steamId[32];
   if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId))) {
-    PrintToChat(client, "[SM] No pude leer tu SteamID64.");
+    MC_PrintToChat(client, "[SM] {red}No pude leer tu SteamID64.");
     return;
   }
 
@@ -729,9 +733,11 @@ void OpenDonationWindow(int client) {
   char url[512];
   FormatApiUrl("/donations/session", url, sizeof(url));
   if (url[0] == '\0') {
-    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
+    MC_PrintToChat(client, "[SM] {red}sm_giveaways_bot_api_base no está configurado.");
     return;
   }
+
+  MC_PrintToChat(client, "[SM] {grey}Abriendo ventana de donación…");
 
   char name[MAX_NAME_LENGTH];
   GetClientName(client, name, sizeof(name));
@@ -755,10 +761,10 @@ void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error
 
   if (error[0] != '\0' || (response.Status != HTTPStatus_Created && response.Status != HTTPStatus_OK)) {
     if (error[0] != '\0') {
-      PrintToChat(client, "[SM] No se pudo preparar la donacion: %s", error);
+      MC_PrintToChat(client, "[SM] {red}No se pudo preparar la donación: %s", error);
     }
     else {
-      PrintToChat(client, "[SM] No se pudo preparar la donacion (HTTP %d).", response.Status);
+      MC_PrintToChat(client, "[SM] {red}No se pudo preparar la donación (HTTP %d).", response.Status);
     }
     return;
   }
@@ -776,13 +782,13 @@ void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error
   char profileUrl[512];
   g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
   if (alreadyActive) {
-    PrintToChat(client, "[SM] Ya tenes una ventana de donacion activa. Usala antes de abrir otra.");
+    MC_PrintToChat(client, "[SM] {orange}Ya tenés una ventana de donación activa. Usala antes de abrir otra.");
   }
   else {
-    PrintToChat(client, "[SM] Ventana de donacion abierta por 15 minutos.");
+    MC_PrintToChat(client, "[SM] {green}Ventana de donación abierta por 15 minutos.");
   }
-  PrintToChat(client, "[SM] Agrega a %s y manda una oferta con solo los items que queres donar.", profileUrl);
-  PrintToChat(client, "[SM] Durante esta ventana no hace falta poner !donar en el trade. Si mandas una oferta directa sin ventana activa, ahi si usa !donar o !donate.");
+  MC_PrintToChat(client, "{default}Agregá a %s y mandá una oferta con solo los ítems que querés donar.", profileUrl);
+  MC_PrintToChat(client, "{default}Durante esta ventana no hace falta poner !donar en el trade. Si mandás una oferta directa sin ventana activa, ahí sí usá !donar o !donate.");
 }
 
 public Action Command_Donations(int client, int args) {
@@ -794,9 +800,11 @@ public Action Command_Donations(int client, int args) {
   char url[512];
   FormatApiUrl("/donations/pending", url, sizeof(url));
   if (url[0] == '\0') {
-    ReplyToCommand(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
+    MC_ReplyToCommand(client, "[SM] {red}sm_giveaways_bot_api_base no está configurado.");
     return Plugin_Handled;
   }
+
+  MC_PrintToChat(client, "[SM] {grey}Cargando donaciones pendientes…");
 
   HTTPRequest req = new HTTPRequest(url);
   req.SetHeader("X-Bot-Secret", "%s", secret);
@@ -832,30 +840,30 @@ void OnPendingDonationsHttp(HTTPResponse response, any userid, const char[] erro
 
   if (error[0] != '\0' || response.Status != HTTPStatus_OK) {
     if (error[0] != '\0') {
-      PrintToChat(client, "[SM] No se pudo cargar la lista de donaciones: %s", error);
+      MC_PrintToChat(client, "[SM] {red}No se pudo cargar la lista de donaciones: %s", error);
     }
     else {
-      PrintToChat(client, "[SM] No se pudo cargar la lista de donaciones (HTTP %d).", response.Status);
+      MC_PrintToChat(client, "[SM] {red}No se pudo cargar la lista de donaciones (HTTP %d).", response.Status);
     }
     return;
   }
 
   JSON root = response.Data;
   if (root == null || !IsValidHandle(root)) {
-    PrintToChat(client, "[SM] La respuesta de donaciones no fue JSON valido.");
+    MC_PrintToChat(client, "[SM] {red}La respuesta de donaciones no fue JSON válido.");
     return;
   }
 
   JSONArray arr = view_as<JSONArray>(root);
   if (arr.Length == 0) {
     delete root;
-    PrintToChat(client, "[SM] No hay donaciones pendientes de revision.");
+    MC_PrintToChat(client, "[SM] {green}No hay donaciones pendientes de revisión.");
     return;
   }
 
   if (!LoadPendingDonationData(arr)) {
     delete root;
-    PrintToChat(client, "[SM] No llegaron donaciones pendientes utilizables.");
+    MC_PrintToChat(client, "[SM] {orange}No llegaron donaciones pendientes utilizables.");
     return;
   }
 
@@ -960,7 +968,7 @@ bool LoadPendingDonationData(JSONArray arr) {
 
 void DisplayDonationListMenu(int client) {
   if (g_DonationOfferIds.Length == 0) {
-    PrintToChat(client, "[SM] No llegaron donaciones pendientes utilizables.");
+    MC_PrintToChat(client, "[SM] {orange}No llegaron donaciones pendientes utilizables.");
     return;
   }
 
@@ -1009,7 +1017,7 @@ void ShowPendingDonationPrompt(int client, int pendingCount) {
   panel.DrawText(" ");
 
   char line[128];
-  Format(line, sizeof(line), "Hay %d donaciones pendientes de revision.", pendingCount);
+  Format(line, sizeof(line), "Hay %d donaciones pendientes.", pendingCount);
   panel.DrawText(line);
   panel.DrawText(" ");
   panel.DrawItem("Revisar ahora");
@@ -1059,7 +1067,7 @@ void ShowDonationReviewPanel(int client, int offerIndex, int page) {
     return;
   }
   if (offerIndex < 0 || offerIndex >= g_DonationOfferIds.Length) {
-    PrintToChat(client, "[SM] La donacion seleccionada ya no esta disponible.");
+    MC_PrintToChat(client, "[SM] {orange}La donación seleccionada ya no está disponible.");
     return;
   }
 
@@ -1085,7 +1093,7 @@ void ShowDonationReviewPanel(int client, int offerIndex, int page) {
   g_DonationOfferDonors.GetString(offerIndex, donor, sizeof(donor));
 
   Panel panel = new Panel();
-  panel.SetTitle("Revision de donacion");
+  panel.SetTitle("Revision de donacion");  // panels don't render accents reliably
   panel.DrawText(" ");
 
   char line[256];
@@ -1126,7 +1134,7 @@ void ShowDonationReviewPanel(int client, int offerIndex, int page) {
     panel.DrawItem("Pagina anterior");
   }
   if (hasNext) {
-    panel.DrawItem("Ver mas items");
+    panel.DrawItem("Ver mas items");  // panels don't render accents reliably
   }
   else {
     panel.DrawItem("Aprobar y aceptar oferta");
@@ -1150,7 +1158,7 @@ public int PanelHandler_DonationReview(Menu menu, MenuAction action, int param1,
 
   int offerIndex = g_SelectedDonationOffer[client];
   if (offerIndex < 0 || offerIndex >= g_DonationOfferIds.Length) {
-    PrintToChat(client, "[SM] La donacion seleccionada ya no esta disponible.");
+    MC_PrintToChat(client, "[SM] {orange}La donación seleccionada ya no está disponible.");
     return 0;
   }
 
@@ -1218,9 +1226,11 @@ void SendDonationReview(int client, const char[] tradeOfferId, bool approve) {
   char url[512];
   FormatApiUrl(path, url, sizeof(url));
   if (url[0] == '\0') {
-    PrintToChat(client, "[SM] sm_giveaways_bot_api_base no esta configurado.");
+    MC_PrintToChat(client, "[SM] {red}sm_giveaways_bot_api_base no está configurado.");
     return;
   }
+
+  MC_PrintToChat(client, "[SM] {grey}Enviando revisión al bot…");
 
   char adminSteamId[32];
   char adminName[MAX_NAME_LENGTH];
@@ -1247,16 +1257,28 @@ void OnDonationReviewHttp(HTTPResponse response, any userid, const char[] error)
   }
 
   if (error[0] != '\0') {
-    PrintToChat(client, "[SM] Fallo la revision de la donacion: %s", error);
+    MC_PrintToChat(client, "[SM] {red}Falló la revisión de la donación: %s", error);
     return;
   }
 
   if (response.Status != HTTPStatus_OK) {
-    PrintToChat(client, "[SM] Fallo la revision de la donacion (HTTP %d).", response.Status);
+    char apiError[256];
+    apiError[0] = '\0';
+    JSON errRoot = response.Data;
+    if (errRoot != null && IsValidHandle(errRoot)) {
+      JSONObject errObj = view_as<JSONObject>(errRoot);
+      errObj.GetString("error", apiError, sizeof(apiError));
+      delete errRoot;
+    }
+    if (apiError[0] != '\0') {
+      MC_PrintToChat(client, "[SM] {red}Falló la revisión (HTTP %d): %s", response.Status, apiError);
+    } else {
+      MC_PrintToChat(client, "[SM] {red}Falló la revisión de la donación (HTTP %d).", response.Status);
+    }
     return;
   }
 
-  PrintToChat(client, "[SM] Revision de donacion enviada.");
+  MC_PrintToChat(client, "[SM] {green}Donación revisada correctamente.");
 }
 
 /* ─── Giveaway forwards ──────────────────────────────────────────────────── */
@@ -1380,7 +1402,7 @@ void OnDeliveryRecordHttp(HTTPResponse response, any userid, const char[] error)
   }
 
   if (isFriend) {
-    PrintToChat(client, "[SM] Ya sos amigo del bot en Steam. La oferta deberia llegar en breve; revisa Steam.");
+    MC_PrintToChat(client, "[SM] {green}Ya sos amigo del bot en Steam. La oferta debería llegar en breve; revisá Steam.");
   }
   else {
     PrintWinnerAddBotHint(userid);
@@ -1394,7 +1416,7 @@ void PrintWinnerAddBotHint(int winnerUid) {
   }
   char profileUrl[512];
   g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
-  PrintToChat(w, "[SM] Felicitaciones! Agrega %s para recibir tu premio.", profileUrl);
+  MC_PrintToChat(w, "[SM] {green}¡Felicitaciones! Agregá %s para recibir tu premio.", profileUrl);
 }
 
 void TrimQuoteEdges(char[] s) {
