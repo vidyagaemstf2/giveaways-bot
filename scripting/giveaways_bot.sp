@@ -8,7 +8,7 @@
 #include <ripext>
 #include <morecolors>
 
-#define PLUGIN_VERSION "2.0.1"
+#define PLUGIN_VERSION "2.0.2"
 #define PRIZE_MAX 127
 #define MAX_ITEMS 256
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
@@ -28,6 +28,7 @@ bool g_bDonationPromptServed[MAXPLAYERS + 1];
 ConVar g_cvApiBase;
 ConVar g_cvApiSecret;
 ConVar g_cvBotProfileUrl;
+ConVar g_cvBotTradeUrl;
 
 ArrayList g_PrizeStrings;
 ArrayList g_PrizeAssetIds;
@@ -69,11 +70,16 @@ public void OnPluginStart() {
     "https://steamcommunity.com/id/your-bot",
     "URL del perfil/comunidad de Steam que se muestra a ganadores."
   );
+  g_cvBotTradeUrl = CreateConVar(
+    "sm_giveaways_bot_trade_url",
+    "",
+    "Link de trade del bot de Steam que se muestra al usar !donar / !donate."
+  );
 
   AutoExecConfig(true, "giveaways_bot", "sourcemod");
 
-  RegConsoleCmd("sm_donar", Command_Donate, "Abrir una ventana de donación con el bot de Steam.");
-  RegConsoleCmd("sm_donate", Command_Donate, "Abrir una ventana de donación con el bot de Steam.");
+  RegConsoleCmd("sm_donar", Command_Donate, "Mostrar el link de trade del bot para donar items.");
+  RegConsoleCmd("sm_donate", Command_Donate, "Mostrar el link de trade del bot para donar items.");
   RegAdminCmd("sm_donaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonations", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
@@ -674,121 +680,17 @@ public Action Command_Donate(int client, int args) {
     return Plugin_Handled;
   }
 
-  ShowDonationConfirmPanel(client);
+  char tradeUrl[512];
+  g_cvBotTradeUrl.GetString(tradeUrl, sizeof(tradeUrl));
+  if (tradeUrl[0] == '\0') {
+    MC_PrintToChat(client, "[SM] {red}El link de trade del bot no está configurado.");
+    return Plugin_Handled;
+  }
+
+  MC_PrintToChat(client, "[SM] {default}Para donar items, usá este link de trade:");
+  MC_PrintToChat(client, "{default}%s", tradeUrl);
+  MC_PrintToChat(client, "{grey}Manda una oferta con solo los items a donar e incluí {default}!donar{grey} en el mensaje.");
   return Plugin_Handled;
-}
-
-void ShowDonationConfirmPanel(int client) {
-  Panel panel = new Panel();
-  panel.SetTitle("Donar items a los sorteos?");
-  panel.DrawText(" ");
-  panel.DrawText("Estas por abrir una ventana de donacion de 15 min con el bot de Steam.");
-  panel.DrawText(" ");
-  panel.DrawText("Que pasa despues:");
-  panel.DrawText("- Agrega al bot en Steam si todavia no son amigos.");
-  panel.DrawText("- Manda una oferta con SOLO los items que queres donar.");
-  panel.DrawText("- Durante esta ventana no hace falta mensaje especial.");
-  panel.DrawText("- Si mandas una oferta directa sin ventana, usa !donar.");
-  panel.DrawText("- Un admin va a revisar la oferta antes de aceptarla.");
-  panel.DrawText(" ");
-  panel.DrawText("No incluyas items que esperas recuperar.");
-  panel.DrawText(" ");
-  panel.DrawItem("Entiendo - abrir ventana de donacion");
-  panel.DrawItem("Cancelar");
-  panel.Send(client, PanelHandler_DonationConfirm, 45);
-  delete panel;
-}
-
-public int PanelHandler_DonationConfirm(Menu menu, MenuAction action, int param1, int param2) {
-  if (action != MenuAction_Select) {
-    return 0;
-  }
-
-  int client = param1;
-  if (client < 1 || !IsClientInGame(client)) {
-    return 0;
-  }
-
-  if (param2 != 1) {
-    MC_PrintToChat(client, "[SM] {grey}Donación cancelada.");
-    return 0;
-  }
-
-  OpenDonationWindow(client);
-  return 0;
-}
-
-void OpenDonationWindow(int client) {
-  char steamId[32];
-  if (!GetClientAuthId(client, AuthId_SteamID64, steamId, sizeof(steamId))) {
-    MC_PrintToChat(client, "[SM] {red}No pude leer tu SteamID64.");
-    return;
-  }
-
-  char secret[256];
-  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
-    return;
-  }
-
-  char url[512];
-  FormatApiUrl("/donations/session", url, sizeof(url));
-  if (url[0] == '\0') {
-    MC_PrintToChat(client, "[SM] {red}sm_giveaways_bot_api_base no está configurado.");
-    return;
-  }
-
-  MC_PrintToChat(client, "[SM] {grey}Abriendo ventana de donación…");
-
-  char name[MAX_NAME_LENGTH];
-  GetClientName(client, name, sizeof(name));
-
-  JSONObject body = new JSONObject();
-  body.SetString("steamId64", steamId);
-  body.SetString("donorName", name);
-
-  HTTPRequest req = new HTTPRequest(url);
-  req.SetHeader("X-Bot-Secret", "%s", secret);
-  req.Timeout = 30;
-  req.Post(body, OnDonationSessionHttp, GetClientUserId(client));
-  delete body;
-}
-
-void OnDonationSessionHttp(HTTPResponse response, any userid, const char[] error) {
-  int client = GetClientOfUserId(userid);
-  if (client < 1 || !IsClientInGame(client)) {
-    return;
-  }
-
-  if (error[0] != '\0' || (response.Status != HTTPStatus_Created && response.Status != HTTPStatus_OK)) {
-    if (error[0] != '\0') {
-      MC_PrintToChat(client, "[SM] {red}No se pudo preparar la donación: %s", error);
-    }
-    else {
-      MC_PrintToChat(client, "[SM] {red}No se pudo preparar la donación (HTTP %d).", response.Status);
-    }
-    return;
-  }
-
-  bool alreadyActive = false;
-  JSON root = response.Data;
-  if (root != null && IsValidHandle(root)) {
-    JSONObject obj = view_as<JSONObject>(root);
-    if (obj.HasKey("alreadyActive")) {
-      alreadyActive = obj.GetBool("alreadyActive");
-    }
-    delete root;
-  }
-
-  char profileUrl[512];
-  g_cvBotProfileUrl.GetString(profileUrl, sizeof(profileUrl));
-  if (alreadyActive) {
-    MC_PrintToChat(client, "[SM] {orange}Ya tenés una ventana de donación activa. Usala antes de abrir otra.");
-  }
-  else {
-    MC_PrintToChat(client, "[SM] {green}Ventana de donación abierta por 15 minutos.");
-  }
-  MC_PrintToChat(client, "{default}Agregá a %s y mandá una oferta con solo los ítems que querés donar.", profileUrl);
-  MC_PrintToChat(client, "{default}Durante esta ventana no hace falta poner !donar en el trade. Si mandás una oferta directa sin ventana activa, ahí sí usá !donar o !donate.");
 }
 
 public Action Command_Donations(int client, int args) {
