@@ -687,8 +687,10 @@ public Action Command_Donate(int client, int args) {
     return Plugin_Handled;
   }
 
-  MC_PrintToChat(client, "[SM] {default}Para donar items, usá este link de trade:");
-  MC_PrintToChat(client, "[SM] {default}%s", tradeUrl);
+  MC_PrintToChat(client, "[SM] {default}Para donar items, usá este link de trade:\n\n");
+  MC_PrintToChat(client, "==============\n");
+  MC_PrintToChat(client, "{default}%s", tradeUrl);
+  MC_PrintToChat(client, "==============\n\n");
   MC_PrintToChat(client, "[SM] {grey}Manda una oferta con solo los items a donar e incluí {default}!donar{grey} en el mensaje.");
   return Plugin_Handled;
 }
