@@ -8,17 +8,20 @@
 #include <ripext>
 #include <morecolors>
 
-#define PLUGIN_VERSION "2.0.2"
+#define PLUGIN_VERSION "2.0.3"
 #define PRIZE_MAX 127
 #define MAX_ITEMS 256
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
 #define TRADE_OFFER_ID_MAX 64
 #define DONATION_ITEM_LABEL_MAX 191
 #define DONATION_ITEMS_PER_PANEL 6
+#define ITEMS_PER_PAGE 6
+#define PRICE_LABEL_MAX 23
 
 // Wizard mode: 0 = none, 1 = gstart, 2 = gsend
 int g_WizardMode[MAXPLAYERS + 1];
 bool g_SelectedItem[MAXPLAYERS + 1][MAX_ITEMS];
+int g_CheckboxPage[MAXPLAYERS + 1];
 char g_SendTargetSteamId[MAXPLAYERS + 1][32];
 char g_SendTargetName[MAXPLAYERS + 1][MAX_NAME_LENGTH];
 
@@ -32,6 +35,8 @@ ConVar g_cvBotTradeUrl;
 
 ArrayList g_PrizeStrings;
 ArrayList g_PrizeAssetIds;
+ArrayList g_PriceCurrencies;
+ArrayList g_PriceValues;
 ArrayList g_TrackedPrizeNames;
 ArrayList g_TrackedAssetIds;
 ArrayList g_DonationOfferIds;
@@ -89,6 +94,8 @@ public void OnPluginStart() {
 
   g_PrizeStrings = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
   g_PrizeAssetIds = new ArrayList(ByteCountToCells(128));
+  g_PriceCurrencies = new ArrayList(ByteCountToCells(8));
+  g_PriceValues = new ArrayList();
   g_TrackedPrizeNames = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
   g_TrackedAssetIds = new ArrayList(ByteCountToCells(128));
   g_DonationOfferIds = new ArrayList(ByteCountToCells(TRADE_OFFER_ID_MAX + 1));
@@ -101,6 +108,8 @@ public void OnPluginStart() {
 public void OnPluginEnd() {
   delete g_PrizeStrings;
   delete g_PrizeAssetIds;
+  delete g_PriceCurrencies;
+  delete g_PriceValues;
   delete g_TrackedPrizeNames;
   delete g_TrackedAssetIds;
   delete g_DonationOfferIds;
@@ -113,6 +122,7 @@ public void OnPluginEnd() {
 public void OnClientDisconnect(int client) {
   g_bDonationPromptServed[client] = false;
   g_WizardMode[client] = 0;
+  g_CheckboxPage[client] = 0;
   g_SendTargetSteamId[client][0] = '\0';
   g_SendTargetName[client][0] = '\0';
   for (int i = 0; i < MAX_ITEMS; i++) {
@@ -256,6 +266,8 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
 
   g_PrizeStrings.Clear();
   g_PrizeAssetIds.Clear();
+  g_PriceCurrencies.Clear();
+  g_PriceValues.Clear();
 
   for (int i = 0; i < len; i++) {
     JSON el = arr.Get(i);
@@ -281,8 +293,27 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
     }
     SanitizeQuotes(name, sizeof(name));
 
+    char priceCurrency[8];
+    float priceValue = 0.0;
+    if (obj.GetString("priceCurrency", priceCurrency, sizeof(priceCurrency))) {
+      if (StrEqual(priceCurrency, "keys")) {
+        priceValue = obj.GetFloat("priceKeys");
+      }
+      else if (StrEqual(priceCurrency, "metal")) {
+        priceValue = obj.GetFloat("priceMetal");
+      }
+      else {
+        priceCurrency[0] = '\0';
+      }
+    }
+    else {
+      priceCurrency[0] = '\0';
+    }
+
     g_PrizeStrings.PushString(name);
     g_PrizeAssetIds.PushString(assetId);
+    g_PriceCurrencies.PushString(priceCurrency);
+    g_PriceValues.Push(priceValue);
 
     delete el;
   }
@@ -296,48 +327,129 @@ void OnInventoryFile(HTTPStatus status, any userid, const char[] error) {
   }
 
   ResetClientSelection(client);
-  OpenCheckboxMenu(client);
+  g_CheckboxPage[client] = 0;
+  OpenCheckboxPanel(client);
 }
 
-/* ─── Checkbox multi-select menu ─────────────────────────────────────────── */
+/* ─── Price label helpers ─────────────────────────────────────────────────── */
 
-void OpenCheckboxMenu(int client) {
-  int nSelected = CountClientSelection(client);
+void TrimTrailingZerosAfterDecimal(char[] s) {
+  int dot = -1;
+  int slen = strlen(s);
+  for (int i = 0; i < slen; i++) {
+    if (s[i] == '.') { dot = i; break; }
+  }
+  if (dot == -1) {
+    return;
+  }
+  int end = slen - 1;
+  while (end > dot && s[end] == '0') {
+    s[end] = '\0';
+    end--;
+  }
+  if (end == dot) {
+    s[dot] = '\0';
+  }
+}
+
+void FormatPriceLabel(char[] out, int maxlen, const char[] currency, float value) {
+  if (currency[0] == '\0' || value <= 0.0) {
+    out[0] = '\0';
+    return;
+  }
+  char valStr[16];
+  Format(valStr, sizeof(valStr), "%.2f", value);
+  TrimTrailingZerosAfterDecimal(valStr);
+  if (StrEqual(currency, "keys")) {
+    Format(out, maxlen, "[%s keys]", valStr);
+  }
+  else {
+    Format(out, maxlen, "[%s ref]", valStr);
+  }
+}
+
+/* ─── Checkbox panel ──────────────────────────────────────────────────────── */
+
+void OpenCheckboxPanel(int client) {
   int itemCount = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
+  int pageCount = itemCount > 0 ? (itemCount + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE : 1;
+  int page = g_CheckboxPage[client];
+  if (page < 0) { page = 0; }
+  if (page >= pageCount) { page = pageCount - 1; }
+  g_CheckboxPage[client] = page;
 
-  Menu menu = new Menu(MenuHandler_Checkbox);
+  int nSelected = CountClientSelection(client);
+  int firstItem = page * ITEMS_PER_PAGE;
 
-  char confirmLabel[64];
+  bool hasPrev = page > 0;
+  bool hasNext = (page + 1) < pageCount;
+
+  Panel panel = new Panel();
+  char title[48];
+  Format(title, sizeof(title), "Seleccionar premio (%d sel.)", nSelected);
+  panel.SetTitle(title);
+  panel.DrawText(" ");
+
+  // Slot 1: Confirm (always)
+  char confirmLabel[48];
   Format(confirmLabel, sizeof(confirmLabel), "Confirmar (%d seleccionados)", nSelected);
-  menu.AddItem("confirm", confirmLabel, nSelected > 0 ? ITEMDRAW_DEFAULT : ITEMDRAW_DISABLED);
+  panel.DrawItem(confirmLabel);
+  panel.DrawText(" ");
 
-  for (int i = 0; i < itemCount; i++) {
-    char name[PRIZE_MAX + 1];
-    g_PrizeStrings.GetString(i, name, sizeof(name));
+  // Slots 2-7: Items (always exactly ITEMS_PER_PAGE slots)
+  for (int slot = 0; slot < ITEMS_PER_PAGE; slot++) {
+    int i = firstItem + slot;
+    if (i < itemCount) {
+      char name[PRIZE_MAX + 1];
+      g_PrizeStrings.GetString(i, name, sizeof(name));
 
-    char label[PRIZE_MAX + 6];
-    Format(label, sizeof(label), "%s %s", g_SelectedItem[client][i] ? "[x]" : "[ ]", name);
-    if (strlen(label) > 62) {
-      label[59] = '.';
-      label[60] = '.';
-      label[61] = '.';
-      label[62] = '\0';
+      int donorSuffix = StrContains(name, " (donado por ");
+      if (donorSuffix != -1) {
+        name[donorSuffix] = '\0';
+      }
+
+      char priceCurrency[8];
+      g_PriceCurrencies.GetString(i, priceCurrency, sizeof(priceCurrency));
+      float priceValue = g_PriceValues.Get(i);
+
+      char priceLabel[PRICE_LABEL_MAX + 1];
+      FormatPriceLabel(priceLabel, sizeof(priceLabel), priceCurrency, priceValue);
+
+      char label[64];
+      if (priceLabel[0] != '\0') {
+        Format(label, sizeof(label), "%s %s %s",
+          g_SelectedItem[client][i] ? "[x]" : "[ ]",
+          priceLabel,
+          name);
+      }
+      else {
+        Format(label, sizeof(label), "%s %s",
+          g_SelectedItem[client][i] ? "[x]" : "[ ]",
+          name);
+      }
+
+      panel.DrawItem(label);
     }
-
-    char key[8];
-    IntToString(i, key, sizeof(key));
-    menu.AddItem(key, label);
+    else {
+      panel.DrawItem("---", ITEMDRAW_DISABLED);
+    }
   }
 
-  menu.ExitButton = true;
-  menu.Display(client, MENU_TIME_FOREVER);
+  panel.DrawText(" ");
+  // Slot 8: Previous page (greyed out on first page)
+  panel.DrawItem("< Pagina anterior", hasPrev ? ITEMDRAW_DEFAULT : ITEMDRAW_DISABLED);
+
+  // Slot 9: Next page (greyed out on last page)
+  panel.DrawItem("Siguiente pagina >", hasNext ? ITEMDRAW_DEFAULT : ITEMDRAW_DISABLED);
+
+  // Slot 0 (10th): Exit (always)
+  panel.DrawItem("Cancelar");
+
+  panel.Send(client, PanelHandler_Checkbox, MENU_TIME_FOREVER);
+  delete panel;
 }
 
-public int MenuHandler_Checkbox(Menu menu, MenuAction action, int param1, int param2) {
-  if (action == MenuAction_End) {
-    delete menu;
-    return 0;
-  }
+public int PanelHandler_Checkbox(Menu menu, MenuAction action, int param1, int param2) {
   if (action == MenuAction_Cancel) {
     g_WizardMode[param1] = 0;
     return 0;
@@ -347,10 +459,22 @@ public int MenuHandler_Checkbox(Menu menu, MenuAction action, int param1, int pa
   }
 
   int client = param1;
-  char key[8];
-  menu.GetItem(param2, key, sizeof(key));
+  int page = g_CheckboxPage[client];
+  int itemCount = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
+  int pageCount = itemCount > 0 ? (itemCount + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE : 1;
+  int firstItem = page * ITEMS_PER_PAGE;
 
-  if (StrEqual(key, "confirm")) {
+  bool hasPrev = page > 0;
+  bool hasNext = (page + 1) < pageCount;
+
+  // Slot 1: Confirm
+  if (param2 == 1) {
+    int nSelected = CountClientSelection(client);
+    if (nSelected == 0) {
+      MC_PrintToChat(client, "[SM] {orange}Selecciona al menos un item.");
+      OpenCheckboxPanel(client);
+      return 0;
+    }
     int mode = g_WizardMode[client];
     if (mode == 1) {
       ShowGstartSummaryPanel(client);
@@ -361,12 +485,36 @@ public int MenuHandler_Checkbox(Menu menu, MenuAction action, int param1, int pa
     return 0;
   }
 
-  int idx = StringToInt(key);
-  if (idx >= 0 && idx < MAX_ITEMS) {
-    g_SelectedItem[client][idx] = !g_SelectedItem[client][idx];
+  // Slots 2-7: Item toggles
+  if (param2 >= 2 && param2 <= 7) {
+    int itemIdx = firstItem + (param2 - 2);
+    if (itemIdx < itemCount && itemIdx < MAX_ITEMS) {
+      g_SelectedItem[client][itemIdx] = !g_SelectedItem[client][itemIdx];
+    }
+    OpenCheckboxPanel(client);
+    return 0;
   }
 
-  OpenCheckboxMenu(client);
+  // Slot 8: Previous page
+  if (param2 == 8) {
+    if (hasPrev) {
+      g_CheckboxPage[client]--;
+      OpenCheckboxPanel(client);
+    }
+    return 0;
+  }
+
+  // Slot 9: Next page
+  if (param2 == 9) {
+    if (hasNext) {
+      g_CheckboxPage[client]++;
+      OpenCheckboxPanel(client);
+    }
+    return 0;
+  }
+
+  // Slot 0 (10th = 0): Exit
+  g_WizardMode[client] = 0;
   return 0;
 }
 
