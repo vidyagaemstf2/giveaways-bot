@@ -8,7 +8,7 @@
 #include <ripext>
 #include <morecolors>
 
-#define PLUGIN_VERSION "2.0.3"
+#define PLUGIN_VERSION "2.0.4"
 #define PRIZE_MAX 127
 #define MAX_ITEMS 256
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
@@ -47,6 +47,17 @@ ArrayList g_DonationItemLabels;
 
 int g_SelectedDonationOffer[MAXPLAYERS + 1];
 int g_SelectedDonationPage[MAXPLAYERS + 1];
+
+ArrayList g_ReclaimAssetIds;
+ArrayList g_ReclaimItemNames;
+ArrayList g_ReclaimWinnerIds;
+ArrayList g_ReclaimWinnerNames;
+ArrayList g_ReclaimStatuses;
+int g_ReclaimSelectedIdx[MAXPLAYERS + 1];
+int g_ReclaimListPage[MAXPLAYERS + 1];
+int g_PendingReclaimAction[MAXPLAYERS + 1];
+char g_PendingReclaimAssetId[MAXPLAYERS + 1][128];
+char g_PendingReclaimItemName[MAXPLAYERS + 1][PRIZE_MAX + 1];
 
 public Plugin myinfo = {
   name = "Giveaways - Steam bot bridge",
@@ -89,6 +100,8 @@ public void OnPluginStart() {
   RegAdminCmd("sm_gdonaciones", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gdonations", Command_Donations, ADMFLAG_GENERIC, "Revisar donaciones pendientes del bot de Steam.");
   RegAdminCmd("sm_gsend", Command_GsendTarget, ADMFLAG_GENERIC, "Enviar item(s) del inventario del bot a un jugador. Uso: sm_gsend <jugador | @me>");
+  RegAdminCmd("sm_greclaim", Command_Greclaim, ADMFLAG_GENERIC, "Revocar una entrega activa de un ganador y devolverla al pool, reasignarla o repetir el sorteo.");
+  RegAdminCmd("sm_grevoke", Command_Greclaim, ADMFLAG_GENERIC, "Revocar una entrega activa de un ganador y devolverla al pool, reasignarla o repetir el sorteo.");
 
   HookEvent("post_inventory_application", Event_PostInventoryApplication, EventHookMode_Post);
 
@@ -103,6 +116,12 @@ public void OnPluginStart() {
   g_DonationOfferItemStarts = new ArrayList();
   g_DonationOfferItemCounts = new ArrayList();
   g_DonationItemLabels = new ArrayList(ByteCountToCells(DONATION_ITEM_LABEL_MAX + 1));
+
+  g_ReclaimAssetIds = new ArrayList(ByteCountToCells(128));
+  g_ReclaimItemNames = new ArrayList(ByteCountToCells(PRIZE_MAX + 1));
+  g_ReclaimWinnerIds = new ArrayList(ByteCountToCells(32));
+  g_ReclaimWinnerNames = new ArrayList(ByteCountToCells(MAX_NAME_LENGTH));
+  g_ReclaimStatuses = new ArrayList(ByteCountToCells(16));
 }
 
 public void OnPluginEnd() {
@@ -117,6 +136,12 @@ public void OnPluginEnd() {
   delete g_DonationOfferItemStarts;
   delete g_DonationOfferItemCounts;
   delete g_DonationItemLabels;
+
+  delete g_ReclaimAssetIds;
+  delete g_ReclaimItemNames;
+  delete g_ReclaimWinnerIds;
+  delete g_ReclaimWinnerNames;
+  delete g_ReclaimStatuses;
 }
 
 public void OnClientDisconnect(int client) {
@@ -130,6 +155,11 @@ public void OnClientDisconnect(int client) {
   }
   g_SelectedDonationOffer[client] = -1;
   g_SelectedDonationPage[client] = 0;
+  g_ReclaimSelectedIdx[client] = -1;
+  g_ReclaimListPage[client] = 0;
+  g_PendingReclaimAction[client] = 0;
+  g_PendingReclaimAssetId[client][0] = '\0';
+  g_PendingReclaimItemName[client][0] = '\0';
 }
 
 /* ─── Shared helpers ─────────────────────────────────────────────────────── */
@@ -1331,6 +1361,505 @@ void OnDonationReviewHttp(HTTPResponse response, any userid, const char[] error)
   }
 
   MC_PrintToChat(client, "[SM] {green}Donación revisada correctamente.");
+}
+
+/* ─── Prize revoke (sm_greclaim / sm_grevoke) ────────────────────────────── */
+
+public Action Command_Greclaim(int client, int args) {
+  if (client < 1 || !IsClientInGame(client)) {
+    return Plugin_Handled;
+  }
+  FetchActiveDeliveries(client);
+  return Plugin_Handled;
+}
+
+void FetchActiveDeliveries(int client) {
+  char secret[256];
+  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
+    return;
+  }
+
+  char url[512];
+  FormatApiUrl("/delivery/active", url, sizeof(url));
+  if (url[0] == '\0') {
+    MC_PrintToChat(client, "[SM] {red}sm_giveaways_bot_api_base no está configurado.");
+    return;
+  }
+
+  MC_PrintToChat(client, "[SM] {grey}Cargando entregas activas…");
+
+  HTTPRequest req = new HTTPRequest(url);
+  req.SetHeader("X-Bot-Secret", "%s", secret);
+  req.Timeout = 30;
+  req.Get(OnActiveDeliveriesHttp, GetClientUserId(client));
+}
+
+void OnActiveDeliveriesHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (error[0] != '\0' || response.Status != HTTPStatus_OK) {
+    if (error[0] != '\0') {
+      MC_PrintToChat(client, "[SM] {red}No se pudo cargar las entregas activas: %s", error);
+    }
+    else {
+      MC_PrintToChat(client, "[SM] {red}No se pudo cargar las entregas activas (HTTP %d).", response.Status);
+    }
+    return;
+  }
+
+  JSON root = response.Data;
+  if (root == null || !IsValidHandle(root)) {
+    MC_PrintToChat(client, "[SM] {red}La respuesta de entregas no fue JSON válido.");
+    return;
+  }
+
+  JSONArray arr = view_as<JSONArray>(root);
+  if (arr.Length == 0) {
+    delete root;
+    MC_PrintToChat(client, "[SM] {green}No hay entregas activas en este momento.");
+    return;
+  }
+
+  LoadActiveDeliveryData(arr);
+  delete root;
+  DisplayReclaimListPanel(client, 0);
+}
+
+void LoadActiveDeliveryData(JSONArray arr) {
+  g_ReclaimAssetIds.Clear();
+  g_ReclaimItemNames.Clear();
+  g_ReclaimWinnerIds.Clear();
+  g_ReclaimWinnerNames.Clear();
+  g_ReclaimStatuses.Clear();
+
+  for (int i = 0; i < arr.Length; i++) {
+    JSON el = arr.Get(i);
+    if (el == null || !IsValidHandle(el)) {
+      continue;
+    }
+
+    JSONObject obj = view_as<JSONObject>(el);
+
+    char assetId[128];
+    char itemName[PRIZE_MAX + 1];
+    char winnerId[32];
+    char winnerName[MAX_NAME_LENGTH];
+    char status[16];
+
+    assetId[0] = '\0';
+    itemName[0] = '\0';
+    winnerId[0] = '\0';
+    winnerName[0] = '\0';
+    status[0] = '\0';
+
+    obj.GetString("assetId", assetId, sizeof(assetId));
+    obj.GetString("itemName", itemName, sizeof(itemName));
+    obj.GetString("winnerSteamId", winnerId, sizeof(winnerId));
+    if (!obj.GetString("winnerName", winnerName, sizeof(winnerName)) || winnerName[0] == '\0') {
+      strcopy(winnerName, sizeof(winnerName), winnerId);
+    }
+    obj.GetString("status", status, sizeof(status));
+
+    if (assetId[0] != '\0' && itemName[0] != '\0' && winnerId[0] != '\0') {
+      g_ReclaimAssetIds.PushString(assetId);
+      g_ReclaimItemNames.PushString(itemName);
+      g_ReclaimWinnerIds.PushString(winnerId);
+      g_ReclaimWinnerNames.PushString(winnerName);
+      g_ReclaimStatuses.PushString(status);
+    }
+
+    delete el;
+  }
+}
+
+void DisplayReclaimListPanel(int client, int page) {
+  int total = g_ReclaimAssetIds.Length;
+  if (total == 0) {
+    MC_PrintToChat(client, "[SM] {green}No hay entregas activas en este momento.");
+    return;
+  }
+
+  int pageCount = (total + 6) / 7;
+  if (page < 0) page = 0;
+  if (page >= pageCount) page = pageCount - 1;
+
+  g_ReclaimListPage[client] = page;
+
+  int firstItem = page * 7;
+  bool hasPrev = page > 0;
+  bool hasNext = (page + 1) < pageCount;
+
+  Panel panel = new Panel();
+  char title[64];
+  if (pageCount > 1) {
+    Format(title, sizeof(title), "Entregas activas (%d/%d)", page + 1, pageCount);
+  }
+  else {
+    strcopy(title, sizeof(title), "Entregas activas");
+  }
+  panel.SetTitle(title);
+  panel.DrawText(" ");
+
+  // Slots 1-7: always exactly 7 item slots
+  for (int slot = 0; slot < 7; slot++) {
+    int i = firstItem + slot;
+    if (i < total) {
+      char itemName[PRIZE_MAX + 1];
+      char winnerName[MAX_NAME_LENGTH];
+      char status[16];
+      char line[256];
+      char statusTag[4];
+
+      g_ReclaimItemNames.GetString(i, itemName, sizeof(itemName));
+      g_ReclaimWinnerNames.GetString(i, winnerName, sizeof(winnerName));
+      g_ReclaimStatuses.GetString(i, status, sizeof(status));
+
+      int donorSuffix = StrContains(itemName, " (donado por ");
+      if (donorSuffix != -1) {
+        itemName[donorSuffix] = '\0';
+      }
+
+      if (StrEqual(status, "offer_sent")) {
+        strcopy(statusTag, sizeof(statusTag), "[E]");
+      }
+      else {
+        strcopy(statusTag, sizeof(statusTag), "[P]");
+      }
+
+      Format(line, sizeof(line), "%s %s => %s", statusTag, itemName, winnerName);
+      panel.DrawItem(line);
+    }
+    else {
+      panel.DrawItem("---", ITEMDRAW_DISABLED);
+    }
+  }
+
+  panel.DrawText(" ");
+
+  // Slot 8: Previous page (always present, disabled on first page)
+  panel.DrawItem("< Pagina anterior", hasPrev ? ITEMDRAW_DEFAULT : ITEMDRAW_DISABLED);
+
+  // Slot 9: Next page (always present, disabled on last page)
+  panel.DrawItem("Siguiente pagina >", hasNext ? ITEMDRAW_DEFAULT : ITEMDRAW_DISABLED);
+
+  // Slot 0 (10th): Close (always present)
+  panel.DrawItem("Cerrar");
+
+  panel.Send(client, PanelHandler_ReclaimList, MENU_TIME_FOREVER);
+  delete panel;
+}
+
+public int PanelHandler_ReclaimList(Menu menu, MenuAction action, int param1, int param2) {
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  int client = param1;
+  if (client < 1 || !IsClientInGame(client)) {
+    return 0;
+  }
+
+  int page = g_ReclaimListPage[client];
+  int total = g_ReclaimAssetIds.Length;
+  if (total == 0) {
+    return 0;
+  }
+
+  int pageCount = (total + 6) / 7;
+  if (page >= pageCount) page = pageCount - 1;
+
+  int firstItem = page * 7;
+  bool hasPrev = page > 0;
+  bool hasNext = (page + 1) < pageCount;
+
+  // Slots 1-7: item selection
+  if (param2 >= 1 && param2 <= 7) {
+    int index = firstItem + (param2 - 1);
+    if (index < total) {
+      g_ReclaimSelectedIdx[client] = index;
+      ShowReclaimActionPanel(client, index);
+    }
+    return 0;
+  }
+
+  // Slot 8: Previous page
+  if (param2 == 8) {
+    if (hasPrev) {
+      DisplayReclaimListPanel(client, page - 1);
+    }
+    return 0;
+  }
+
+  // Slot 9: Next page
+  if (param2 == 9) {
+    if (hasNext) {
+      DisplayReclaimListPanel(client, page + 1);
+    }
+    return 0;
+  }
+
+  // Slot 0 (10th): Close — do nothing
+  return 0;
+}
+
+void ShowReclaimActionPanel(int client, int index) {
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+  if (index < 0 || index >= g_ReclaimAssetIds.Length) {
+    MC_PrintToChat(client, "[SM] {orange}La entrega seleccionada ya no está disponible.");
+    return;
+  }
+
+  char itemName[PRIZE_MAX + 1];
+  char winnerName[MAX_NAME_LENGTH];
+  char status[16];
+  g_ReclaimItemNames.GetString(index, itemName, sizeof(itemName));
+  g_ReclaimWinnerNames.GetString(index, winnerName, sizeof(winnerName));
+  g_ReclaimStatuses.GetString(index, status, sizeof(status));
+
+  Panel panel = new Panel();
+  panel.SetTitle("Revocar entrega");
+  panel.DrawText(" ");
+
+  char line[192];
+  Format(line, sizeof(line), "Item: %s", itemName);
+  panel.DrawText(line);
+  Format(line, sizeof(line), "Ganador: %s", winnerName);
+  panel.DrawText(line);
+
+  char statusLabel[48];
+  if (StrEqual(status, "offer_sent")) {
+    strcopy(statusLabel, sizeof(statusLabel), "Oferta enviada (se cancelara)");
+  }
+  else {
+    strcopy(statusLabel, sizeof(statusLabel), "Pendiente");
+  }
+  Format(line, sizeof(line), "Estado: %s", statusLabel);
+  panel.DrawText(line);
+  panel.DrawText(" ");
+
+  panel.DrawItem("Devolver al pool");
+  panel.DrawItem("Asignar a otro jugador");
+  panel.DrawItem("Repetir sorteo");
+  panel.DrawItem("Volver");
+
+  panel.Send(client, PanelHandler_ReclaimAction, MENU_TIME_FOREVER);
+  delete panel;
+}
+
+public int PanelHandler_ReclaimAction(Menu menu, MenuAction action, int param1, int param2) {
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  int client = param1;
+  if (client < 1 || !IsClientInGame(client)) {
+    return 0;
+  }
+
+  int index = g_ReclaimSelectedIdx[client];
+  if (index < 0 || index >= g_ReclaimAssetIds.Length) {
+    MC_PrintToChat(client, "[SM] {orange}La entrega seleccionada ya no está disponible.");
+    return 0;
+  }
+
+  char assetId[128];
+  char itemName[PRIZE_MAX + 1];
+  g_ReclaimAssetIds.GetString(index, assetId, sizeof(assetId));
+  g_ReclaimItemNames.GetString(index, itemName, sizeof(itemName));
+
+  if (param2 == 1) {
+    g_PendingReclaimAction[client] = 1;
+    strcopy(g_PendingReclaimAssetId[client], sizeof(g_PendingReclaimAssetId[]), assetId);
+    strcopy(g_PendingReclaimItemName[client], sizeof(g_PendingReclaimItemName[]), itemName);
+    SendRevoke(client, assetId, "return_to_pool", "");
+  }
+  else if (param2 == 2) {
+    g_PendingReclaimAction[client] = 2;
+    strcopy(g_PendingReclaimAssetId[client], sizeof(g_PendingReclaimAssetId[]), assetId);
+    strcopy(g_PendingReclaimItemName[client], sizeof(g_PendingReclaimItemName[]), itemName);
+    ShowReclaimTargetMenu(client);
+  }
+  else if (param2 == 3) {
+    g_PendingReclaimAction[client] = 3;
+    strcopy(g_PendingReclaimAssetId[client], sizeof(g_PendingReclaimAssetId[]), assetId);
+    strcopy(g_PendingReclaimItemName[client], sizeof(g_PendingReclaimItemName[]), itemName);
+    SendRevoke(client, assetId, "return_to_pool", "");
+  }
+  else if (param2 == 4) {
+    DisplayReclaimListPanel(client, g_ReclaimListPage[client]);
+  }
+
+  return 0;
+}
+
+void ShowReclaimTargetMenu(int client) {
+  Menu menu = new Menu(MenuHandler_ReclaimTarget);
+  menu.SetTitle("Asignar premio a...");
+
+  for (int i = 1; i <= MaxClients; i++) {
+    if (!IsClientInGame(i) || IsFakeClient(i)) {
+      continue;
+    }
+
+    char steamId[32];
+    if (!GetClientAuthId(i, AuthId_SteamID64, steamId, sizeof(steamId))) {
+      continue;
+    }
+
+    char playerName[MAX_NAME_LENGTH];
+    GetClientName(i, playerName, sizeof(playerName));
+
+    menu.AddItem(steamId, playerName);
+  }
+
+  if (menu.ItemCount == 0) {
+    delete menu;
+    MC_PrintToChat(client, "[SM] {orange}No hay jugadores disponibles para asignar el premio.");
+    ShowReclaimActionPanel(client, g_ReclaimSelectedIdx[client]);
+    return;
+  }
+
+  menu.ExitButton = true;
+  menu.Display(client, MENU_TIME_FOREVER);
+}
+
+public int MenuHandler_ReclaimTarget(Menu menu, MenuAction action, int param1, int param2) {
+  if (action == MenuAction_End) {
+    delete menu;
+    return 0;
+  }
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  int client = param1;
+  if (client < 1 || !IsClientInGame(client)) {
+    return 0;
+  }
+
+  char steamId[32];
+  char playerName[MAX_NAME_LENGTH];
+  menu.GetItem(param2, steamId, sizeof(steamId), _, playerName, sizeof(playerName));
+
+  SendRevoke(client, g_PendingReclaimAssetId[client], "reassign", steamId);
+  return 0;
+}
+
+void SendRevoke(int client, const char[] assetId, const char[] action, const char[] targetSteamId) {
+  char secret[256];
+  if (!GetApiSecretOrReply(client, secret, sizeof(secret))) {
+    return;
+  }
+
+  char url[512];
+  FormatApiUrl("/delivery/revoke", url, sizeof(url));
+  if (url[0] == '\0') {
+    MC_PrintToChat(client, "[SM] {red}sm_giveaways_bot_api_base no está configurado.");
+    return;
+  }
+
+  MC_PrintToChat(client, "[SM] {grey}Procesando revocacion…");
+
+  char adminSteamId[32];
+  char adminName[MAX_NAME_LENGTH];
+  adminSteamId[0] = '\0';
+  if (!GetClientAuthId(client, AuthId_SteamID64, adminSteamId, sizeof(adminSteamId))) {
+    adminSteamId[0] = '\0';
+  }
+  GetClientName(client, adminName, sizeof(adminName));
+
+  JSONObject body = new JSONObject();
+  body.SetString("assetId", assetId);
+  body.SetString("action", action);
+  if (targetSteamId[0] != '\0') {
+    body.SetString("targetSteamId", targetSteamId);
+  }
+  body.SetString("adminSteamId", adminSteamId);
+  body.SetString("adminName", adminName);
+
+  HTTPRequest req = new HTTPRequest(url);
+  req.SetHeader("X-Bot-Secret", "%s", secret);
+  req.Timeout = 45;
+  req.Post(body, OnRevokeHttp, GetClientUserId(client));
+  delete body;
+}
+
+void OnRevokeHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (error[0] != '\0') {
+    MC_PrintToChat(client, "[SM] {red}Error al revocar la entrega: %s", error);
+    return;
+  }
+
+  if (response.Status != HTTPStatus_OK) {
+    char apiError[256];
+    apiError[0] = '\0';
+    JSON errRoot = response.Data;
+    if (errRoot != null && IsValidHandle(errRoot)) {
+      JSONObject errObj = view_as<JSONObject>(errRoot);
+      errObj.GetString("error", apiError, sizeof(apiError));
+      delete errRoot;
+    }
+    if (apiError[0] != '\0') {
+      MC_PrintToChat(client, "[SM] {red}No se pudo revocar la entrega: %s", apiError);
+    }
+    else {
+      MC_PrintToChat(client, "[SM] {red}No se pudo revocar la entrega (HTTP %d).", response.Status);
+    }
+    return;
+  }
+
+  int pendingAction = g_PendingReclaimAction[client];
+  char itemName[PRIZE_MAX + 1];
+  char assetId[128];
+  strcopy(itemName, sizeof(itemName), g_PendingReclaimItemName[client]);
+  strcopy(assetId, sizeof(assetId), g_PendingReclaimAssetId[client]);
+
+  g_PendingReclaimAction[client] = 0;
+  g_PendingReclaimAssetId[client][0] = '\0';
+  g_PendingReclaimItemName[client][0] = '\0';
+
+  if (pendingAction == 1) {
+    MC_PrintToChat(client, "[SM] {green}Premio devuelto al pool correctamente.");
+  }
+  else if (pendingAction == 2) {
+    char targetName[MAX_NAME_LENGTH];
+    targetName[0] = '\0';
+    JSON root = response.Data;
+    if (root != null && IsValidHandle(root)) {
+      JSONObject obj = view_as<JSONObject>(root);
+      obj.GetString("newWinnerName", targetName, sizeof(targetName));
+      delete root;
+    }
+    if (targetName[0] != '\0') {
+      MC_PrintToChat(client, "[SM] {green}Premio reasignado a %s correctamente.", targetName);
+    }
+    else {
+      MC_PrintToChat(client, "[SM] {green}Premio reasignado correctamente.");
+    }
+  }
+  else if (pendingAction == 3) {
+    MC_PrintToChat(client, "[SM] {green}Premio devuelto al pool. Iniciando nuevo sorteo con %s…", itemName);
+
+    g_TrackedPrizeNames.Clear();
+    g_TrackedAssetIds.Clear();
+    g_TrackedPrizeNames.PushString(itemName);
+    g_TrackedAssetIds.PushString(assetId);
+
+    char sanitized[PRIZE_MAX + 1];
+    strcopy(sanitized, sizeof(sanitized), itemName);
+    SanitizeQuotes(sanitized, sizeof(sanitized));
+    FakeClientCommand(client, "sm_gstart_now 1 \"%s\"", sanitized);
+  }
 }
 
 /* ─── Giveaway forwards ──────────────────────────────────────────────────── */
