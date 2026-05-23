@@ -8,7 +8,7 @@
 #include <ripext>
 #include <morecolors>
 
-#define PLUGIN_VERSION "2.0.4"
+#define PLUGIN_VERSION "2.0.5"
 #define PRIZE_MAX 127
 #define MAX_ITEMS 256
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
@@ -1328,19 +1328,19 @@ void SendDonationReview(int client, const char[] tradeOfferId, bool approve) {
   HTTPRequest req = new HTTPRequest(url);
   req.SetHeader("X-Bot-Secret", "%s", secret);
   req.Timeout = 45;
-  req.Post(body, OnDonationReviewHttp, GetClientUserId(client));
+  if (approve) {
+    req.Post(body, OnDonationApproveHttp, GetClientUserId(client));
+  }
+  else {
+    req.Post(body, OnDonationRejectHttp, GetClientUserId(client));
+  }
   delete body;
 }
 
-void OnDonationReviewHttp(HTTPResponse response, any userid, const char[] error) {
-  int client = GetClientOfUserId(userid);
-  if (client < 1 || !IsClientInGame(client)) {
-    return;
-  }
-
+bool HandleDonationHttpError(int client, HTTPResponse response, const char[] error) {
   if (error[0] != '\0') {
     MC_PrintToChat(client, "[SM] {red}Falló la revisión de la donación: %s", error);
-    return;
+    return false;
   }
 
   if (response.Status != HTTPStatus_OK) {
@@ -1354,9 +1354,85 @@ void OnDonationReviewHttp(HTTPResponse response, any userid, const char[] error)
     }
     if (apiError[0] != '\0') {
       MC_PrintToChat(client, "[SM] {red}Falló la revisión (HTTP %d): %s", response.Status, apiError);
-    } else {
+    }
+    else {
       MC_PrintToChat(client, "[SM] {red}Falló la revisión de la donación (HTTP %d).", response.Status);
     }
+    return false;
+  }
+
+  return true;
+}
+
+void OnDonationApproveHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (!HandleDonationHttpError(client, response, error)) {
+    return;
+  }
+
+  MC_PrintToChat(client, "[SM] {green}Donación revisada correctamente.");
+
+  char donorName[128];
+  int itemCount = 0;
+  float totalValue = 0.0;
+  char totalCurrency[8];
+
+  JSON root = response.Data;
+  if (root != null && IsValidHandle(root)) {
+    JSONObject obj = view_as<JSONObject>(root);
+    if (!obj.GetString("donorName", donorName, sizeof(donorName))) {
+      donorName[0] = '\0';
+    }
+    itemCount = obj.GetInt("itemCount");
+    if (obj.HasKey("totalValue")) {
+      totalValue = obj.GetFloat("totalValue");
+    }
+    if (!obj.GetString("totalCurrency", totalCurrency, sizeof(totalCurrency))) {
+      totalCurrency[0] = '\0';
+    }
+    delete root;
+  }
+
+  int offerIndex = g_SelectedDonationOffer[client];
+  if (donorName[0] == '\0' && offerIndex >= 0 && offerIndex < g_DonationOfferIds.Length) {
+    g_DonationOfferDonors.GetString(offerIndex, donorName, sizeof(donorName));
+  }
+  if (itemCount == 0 && offerIndex >= 0 && offerIndex < g_DonationOfferIds.Length) {
+    itemCount = g_DonationOfferItemCounts.Get(offerIndex);
+  }
+  if (donorName[0] == '\0') {
+    strcopy(donorName, sizeof(donorName), "Donante");
+  }
+
+  if (totalValue > 0.0 && totalCurrency[0] != '\0') {
+    char valStr[16];
+    Format(valStr, sizeof(valStr), "%.2f", totalValue);
+    TrimTrailingZerosAfterDecimal(valStr);
+    char priceLabel[32];
+    if (StrEqual(totalCurrency, "keys")) {
+      Format(priceLabel, sizeof(priceLabel), "%s keys", valStr);
+    }
+    else {
+      Format(priceLabel, sizeof(priceLabel), "%s ref", valStr);
+    }
+    MC_PrintToChatAll("[SM] {green}¡Gracias {yellow}%s {green}por donar {yellow}%d {green}item(s) (valorados en {yellow}%s{green}) al pool de premios!", donorName, itemCount, priceLabel);
+  }
+  else {
+    MC_PrintToChatAll("[SM] {green}¡Gracias {yellow}%s {green}por donar {yellow}%d {green}item(s) al pool de premios!", donorName, itemCount);
+  }
+}
+
+void OnDonationRejectHttp(HTTPResponse response, any userid, const char[] error) {
+  int client = GetClientOfUserId(userid);
+  if (client < 1 || !IsClientInGame(client)) {
+    return;
+  }
+
+  if (!HandleDonationHttpError(client, response, error)) {
     return;
   }
 
