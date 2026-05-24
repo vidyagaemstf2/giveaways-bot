@@ -8,7 +8,7 @@
 #include <ripext>
 #include <morecolors>
 
-#define PLUGIN_VERSION "2.0.5"
+#define PLUGIN_VERSION "2.0.6"
 #define PRIZE_MAX 127
 #define MAX_ITEMS 256
 #define INVENTORY_FILE "data/giveaways_bot_inventory.json"
@@ -22,6 +22,7 @@
 int g_WizardMode[MAXPLAYERS + 1];
 bool g_SelectedItem[MAXPLAYERS + 1][MAX_ITEMS];
 int g_CheckboxPage[MAXPLAYERS + 1];
+bool g_BundleMode[MAXPLAYERS + 1];
 char g_SendTargetSteamId[MAXPLAYERS + 1][32];
 char g_SendTargetName[MAXPLAYERS + 1][MAX_NAME_LENGTH];
 
@@ -204,6 +205,7 @@ void ResetClientSelection(int client) {
   for (int i = 0; i < MAX_ITEMS; i++) {
     g_SelectedItem[client][i] = false;
   }
+  g_BundleMode[client] = false;
 }
 
 int CountClientSelection(int client) {
@@ -507,7 +509,11 @@ public int PanelHandler_Checkbox(Menu menu, MenuAction action, int param1, int p
     }
     int mode = g_WizardMode[client];
     if (mode == 1) {
-      ShowGstartSummaryPanel(client);
+      if (nSelected > 1) {
+        ShowDistributionModePanel(client);
+      } else {
+        ShowGstartSummaryPanel(client);
+      }
     }
     else if (mode == 2) {
       ShowGsendSummaryPanel(client);
@@ -548,6 +554,57 @@ public int PanelHandler_Checkbox(Menu menu, MenuAction action, int param1, int p
   return 0;
 }
 
+/* ─── distribution mode panel ───────────────────────────────────────────── */
+
+void ShowDistributionModePanel(int client) {
+  int nSelected = CountClientSelection(client);
+
+  Panel panel = new Panel();
+  char title[64];
+  Format(title, sizeof(title), "Distribución de premios (%d ítems)", nSelected);
+  panel.SetTitle(title);
+  panel.DrawText(" ");
+
+  char opt1[64];
+  Format(opt1, sizeof(opt1), "Un ganador por ítem (%d ganadores)", nSelected);
+  panel.DrawItem(opt1);
+  panel.DrawItem("Todo al mismo ganador (bundle)");
+  panel.DrawText(" ");
+  panel.DrawItem("Cancelar");
+
+  panel.Send(client, PanelHandler_DistributionMode, MENU_TIME_FOREVER);
+  delete panel;
+}
+
+public int PanelHandler_DistributionMode(Menu menu, MenuAction action, int param1, int param2) {
+  if (action == MenuAction_Cancel) {
+    g_WizardMode[param1] = 0;
+    g_BundleMode[param1] = false;
+    return 0;
+  }
+  if (action != MenuAction_Select) {
+    return 0;
+  }
+
+  int client = param1;
+
+  if (param2 == 3) {
+    g_WizardMode[client] = 0;
+    g_BundleMode[client] = false;
+    return 0;
+  }
+
+  if (param2 == 1) {
+    g_BundleMode[client] = false;
+  }
+  else if (param2 == 2) {
+    g_BundleMode[client] = true;
+  }
+
+  ShowGstartSummaryPanel(client);
+  return 0;
+}
+
 /* ─── gstart wizard ──────────────────────────────────────────────────────── */
 
 void ShowGstartSummaryPanel(int client) {
@@ -555,7 +612,11 @@ void ShowGstartSummaryPanel(int client) {
 
   Panel panel = new Panel();
   char title[64];
-  Format(title, sizeof(title), "Sorteo: %d ganador(es)", nSelected);
+  if (g_BundleMode[client]) {
+    Format(title, sizeof(title), "Bundle: 1 ganador, %d ítems", nSelected);
+  } else {
+    Format(title, sizeof(title), "Sorteo: %d ganador(es)", nSelected);
+  }
   panel.SetTitle(title);
   panel.DrawText(" ");
   panel.DrawText("Premios:");
@@ -592,6 +653,7 @@ public int PanelHandler_GstartSummary(Menu menu, MenuAction action, int param1, 
   if (action != MenuAction_Select) {
     if (action == MenuAction_Cancel) {
       g_WizardMode[param1] = 0;
+      g_BundleMode[param1] = false;
     }
     return 0;
   }
@@ -600,6 +662,7 @@ public int PanelHandler_GstartSummary(Menu menu, MenuAction action, int param1, 
 
   if (param2 == 2) {
     g_WizardMode[client] = 0;
+    g_BundleMode[client] = false;
     return 0;
   }
 
@@ -607,6 +670,7 @@ public int PanelHandler_GstartSummary(Menu menu, MenuAction action, int param1, 
   if (nSelected == 0) {
     MC_PrintToChat(client, "[SM] {orange}No seleccionaste ningún ítem.");
     g_WizardMode[client] = 0;
+    g_BundleMode[client] = false;
     return 0;
   }
 
@@ -614,7 +678,8 @@ public int PanelHandler_GstartSummary(Menu menu, MenuAction action, int param1, 
   g_TrackedAssetIds.Clear();
 
   char argsStr[1024];
-  Format(argsStr, sizeof(argsStr), "%d", nSelected);
+  int winnersArg = g_BundleMode[client] ? 1 : nSelected;
+  Format(argsStr, sizeof(argsStr), "%d", winnersArg);
 
   int limit = g_PrizeStrings.Length < MAX_ITEMS ? g_PrizeStrings.Length : MAX_ITEMS;
   for (int i = 0; i < limit; i++) {
@@ -632,6 +697,7 @@ public int PanelHandler_GstartSummary(Menu menu, MenuAction action, int param1, 
   }
 
   g_WizardMode[client] = 0;
+  g_BundleMode[client] = false;
 
   FakeClientCommand(client, "sm_gstart_now %s", argsStr);
   return 0;
